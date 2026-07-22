@@ -1,0 +1,13 @@
+{
+    "display_name": "Chats Manager",
+    "loading_order": 101,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "icedream",
+    "version": "0.6.1",
+    "description": "A native-feeling chat organizer for SillyTavern with folders, pins, branches, lazy loading, and batch management.",
+    "homePage": "https://github.com/dream-ice/chats-manager",
+    "auto_update": true
+}
