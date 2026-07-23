@@ -533,12 +533,40 @@
 .chm-native-selected-count { margin: 0 auto 0 2px; font-size: .76em; white-space: nowrap; opacity: .62; }
 .chm-native-batch-toolbar.is-busy { pointer-events: none; opacity: .55; }
 
+/* Keep the injected checkbox beside the native card even when themes alter
+   SillyTavern's wrapping flex utilities or popup alignment. */
+#select_chat_popup > #select_chat_div {
+    align-self: stretch;
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+#select_chat_div .select_chat_block_wrapper.chm-native-batch-row {
+    display: flex !important;
+    align-items: stretch;
+    flex-flow: row nowrap !important;
+    gap: 5px;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+#select_chat_div .select_chat_block_wrapper.chm-native-batch-row > .select_chat_block {
+    width: auto !important;
+    min-width: 0;
+    flex: 1 1 0 !important;
+}
+
 .chm-native-select {
     display: grid;
     place-items: center;
     align-self: stretch;
     flex: 0 0 31px;
+    width: 31px;
+    max-width: 31px;
     min-height: 42px;
+    margin: 0;
+    padding: 0;
     cursor: pointer;
 }
 
@@ -643,7 +671,7 @@
 .chm-native-folder-caret { opacity: .55; transition: transform 150ms ease; }
 .chm-native-folder-section.is-collapsed .chm-native-folder-caret { transform: rotate(-90deg); }
 .chm-native-folder-section.is-collapsed .chm-native-folder-list { display: none; }
-.chm-native-folder-list > .select_chat_block_wrapper { width: 100%; }
+.chm-native-folder-list > .select_chat_block_wrapper:not(.chm-native-branch) { width: 100%; }
 
 @media (max-width: 700px) {
     .chm-native-batch-toolbar { flex-wrap: nowrap; }

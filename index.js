@@ -1105,8 +1105,10 @@ function updateNativeBatchToolbar() {
 
 function attachNativeBatchCheckbox(wrapper) {
     wrapper.querySelector('.chm-native-select')?.remove();
+    wrapper.classList.remove('chm-native-batch-row');
     wrapper.classList.remove('chm-native-selected');
     if (!nativeBatchMode) return;
+    wrapper.classList.add('chm-native-batch-row');
     const fileName = nativeChatFileName(wrapper);
     const label = document.createElement('label');
     label.className = 'chm-native-select';
