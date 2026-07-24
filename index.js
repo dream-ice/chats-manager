@@ -1,7 +1,9 @@
 import {
     chat_metadata,
+    doNewChat,
     event_types,
     getRequestHeaders,
+    importCharacterChat,
     openCharacterChat,
     renameGroupOrCharacterChat,
     selectCharacterById,
@@ -42,6 +44,10 @@ let nativeBatchMode = false;
 let nativeBatchCharacterKey = '';
 let parentButtonValidationGeneration = 0;
 const nativeSelectedChats = new Set();
+let chatsBatchMode = false;
+let chatsBatchBusy = false;
+const chatsSelectedChats = new Map();
+const renderedChats = new Map();
 
 function settings() {
     extension_settings[MODULE_NAME] ??= structuredClone(DEFAULT_SETTINGS);
@@ -84,6 +90,66 @@ function toggleChatPin(chat) {
     if (index >= 0) pinned.splice(index, 1);
     else pinned.push(key);
     saveSettings();
+}
+
+function setChatPinned(chat, pinned) {
+    const key = chatPinKey(chat);
+    const current = settings().pinnedChats;
+    const index = current.indexOf(key);
+    if (pinned && index < 0) current.push(key);
+    if (!pinned && index >= 0) current.splice(index, 1);
+}
+
+function selectedChats() {
+    return [...chatsSelectedChats.values()];
+}
+
+function setChatSelected(chat, selected) {
+    const key = chatPinKey(chat);
+    if (selected) chatsSelectedChats.set(key, chat);
+    else chatsSelectedChats.delete(key);
+    updateChatsBatchUi();
+}
+
+function updateChatsBatchUi() {
+    if (!chatsPanel) return;
+    chatsPanel.classList.toggle('is-batch-mode', chatsBatchMode);
+    const toggle = chatsPanel.querySelector('.chm-batch-toggle');
+    const bar = chatsPanel.querySelector('.chm-batch-bar');
+    const count = chatsPanel.querySelector('.chm-batch-count');
+    const selectionCount = chatsSelectedChats.size;
+    if (toggle) {
+        toggle.classList.toggle('is-active', chatsBatchMode);
+        toggle.title = chatsBatchMode ? '退出批量编辑' : '批量编辑聊天';
+        toggle.setAttribute('aria-label', toggle.title);
+        toggle.innerHTML = chatsBatchMode
+            ? '<i class="fa-solid fa-xmark" aria-hidden="true"></i>'
+            : '<i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>';
+    }
+    if (bar) {
+        bar.hidden = !chatsBatchMode;
+        bar.classList.toggle('is-busy', chatsBatchBusy);
+        bar.querySelectorAll('[data-requires-selection]').forEach(button => {
+            button.disabled = chatsBatchBusy || selectionCount === 0;
+        });
+        bar.querySelectorAll('button:not([data-requires-selection])').forEach(button => {
+            button.disabled = chatsBatchBusy;
+        });
+    }
+    if (count) count.textContent = `已选 ${selectionCount}`;
+    const batchPin = chatsPanel.querySelector('.chm-batch-pin');
+    if (batchPin) {
+        const unpin = selectionCount > 0 && selectedChats().every(isChatPinned);
+        batchPin.title = unpin ? '取消收藏所选聊天' : '收藏所选聊天';
+        const label = batchPin.querySelector('span');
+        if (label) label.textContent = unpin ? '取消收藏' : '收藏';
+    }
+    chatsPanel.querySelectorAll('.chm-chat-row').forEach(row => {
+        const selected = chatsSelectedChats.has(row.dataset.chatKey);
+        row.classList.toggle('is-selected', selected);
+        const checkbox = row.querySelector('.chm-batch-checkbox');
+        if (checkbox) checkbox.checked = selected;
+    });
 }
 
 function characterKey(character) {
@@ -468,6 +534,300 @@ async function chooseFolder(chat) {
     await refreshChats();
 }
 
+async function exportChats(chats, format) {
+    if (!chats.length) return;
+    chatsBatchBusy = true;
+    updateChatsBatchUi();
+    let exported = 0;
+    try {
+        await SillyTavern.getContext().saveChat?.();
+        for (const chat of chats) {
+            const fileName = `${chat.fileName}.${format}`;
+            const response = await fetch('/api/chats/export', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({
+                    is_group: false,
+                    avatar_url: chat.character.avatar,
+                    file: `${chat.fileName}.jsonl`,
+                    exportfilename: fileName,
+                    format,
+                }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data?.message || `无法导出 ${chat.fileName}`);
+            const downloadName = chats.length > 1 ? `${chat.character.name} - ${fileName}` : fileName;
+            download(data.result, downloadName, format === 'txt' ? 'text/plain' : 'application/octet-stream');
+            exported++;
+        }
+        toastr.success(`已导出 ${exported} 个聊天文件`);
+    } catch (error) {
+        console.error('[Chats Manager] Export failed', error);
+        toastr.error(`导出中断：${error.message}`);
+    } finally {
+        chatsBatchBusy = false;
+        updateChatsBatchUi();
+    }
+}
+
+function removeChatReferences(chat) {
+    const library = getLibrary(chat.characterKey);
+    delete library.chatFolders[chat.fileName];
+    delete library.chatAliases[chat.fileName];
+    for (const [oldName, currentName] of Object.entries(library.chatAliases)) {
+        if (currentName === chat.fileName) delete library.chatAliases[oldName];
+    }
+    settings().pinnedChats = settings().pinnedChats.filter(key => key !== chatPinKey(chat));
+    chatsSelectedChats.delete(chatPinKey(chat));
+}
+
+async function deleteChats(chats) {
+    const unique = [...new Map(chats.map(chat => [chatPinKey(chat), chat])).values()];
+    if (!unique.length) return;
+    const content = document.createElement('div');
+    const title = document.createElement('h3');
+    title.textContent = unique.length === 1 ? `删除“${unique[0].fileName}”？` : `删除选中的 ${unique.length} 个聊天？`;
+    const warning = document.createElement('p');
+    warning.className = 'chm-popup-note';
+    warning.textContent = '聊天文件会被永久删除，此操作无法撤销。若删除父聊天，已有分支聊天不会自动删除。';
+    content.append(title, warning);
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '删除', cancelButton: t`Cancel` });
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+    chatsBatchBusy = true;
+    updateChatsBatchUi();
+    const invalidated = new Set();
+    try {
+        await SillyTavern.getContext().saveChat?.();
+        for (const chat of unique) {
+            const liveEntry = Object.entries(SillyTavern.getContext().characters || [])
+                .find(([, character]) => characterKey(character) === chat.characterKey);
+            if (!liveEntry) continue;
+            await deleteCharacterChatByName(String(liveEntry[0]), chat.fileName);
+            removeChatReferences(chat);
+            invalidated.add(chat.characterKey);
+        }
+        invalidated.forEach(invalidateCharacterCache);
+        saveSettings();
+        toastr.success(`已删除 ${unique.length} 个聊天`);
+        await refreshChats();
+        scheduleNativeChatGrouping();
+    } catch (error) {
+        console.error('[Chats Manager] Delete failed', error);
+        toastr.error(`删除中断：${error.message}`);
+    } finally {
+        chatsBatchBusy = false;
+        updateChatsBatchUi();
+    }
+}
+
+async function chooseTargetCharacter(title) {
+    const descriptors = getCharacterDescriptors().sort((a, b) => a.character.name.localeCompare(b.character.name));
+    if (!descriptors.length) return null;
+    const focusedKey = chatsPanel?.dataset.focusCharacterKey || '';
+    if (focusedKey) return descriptors.find(item => item.key === focusedKey) || null;
+    const content = document.createElement('div');
+    const heading = document.createElement('h3');
+    heading.textContent = title;
+    const select = document.createElement('select');
+    select.className = 'text_pole wide100p';
+    const activeKey = getActiveCharacterKey();
+    for (const descriptor of descriptors) {
+        const option = document.createElement('option');
+        option.value = descriptor.key;
+        option.textContent = descriptor.character.name;
+        option.selected = descriptor.key === activeKey;
+        select.append(option);
+    }
+    content.append(heading, select);
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '继续', cancelButton: t`Cancel` });
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return null;
+    return descriptors.find(item => item.key === select.value) || null;
+}
+
+async function importChatsToCharacter() {
+    const target = await chooseTargetCharacter('选择聊天导入到哪个角色');
+    if (!target) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,.jsonl';
+    input.multiple = true;
+    input.hidden = true;
+    document.body.append(input);
+    const removeCancelledPicker = () => {
+        setTimeout(() => {
+            if (!input.files?.length) input.remove();
+        }, 250);
+    };
+    window.addEventListener('focus', removeCancelledPicker, { once: true });
+    input.addEventListener('change', async () => {
+        let imported = 0;
+        try {
+            for (const file of input.files || []) {
+                const format = file.name.match(/\.(jsonl?)$/i)?.[1]?.toLowerCase();
+                if (!format) {
+                    toastr.warning(`不支持的文件：${file.name}`);
+                    continue;
+                }
+                const formData = new FormData();
+                formData.set('file_type', format);
+                formData.set('avatar', file);
+                formData.set('avatar_url', target.character.avatar);
+                formData.set('user_name', SillyTavern.getContext().name1 || 'User');
+                formData.set('character_name', target.character.name || 'Character');
+                const result = await importCharacterChat(formData, { refresh: false });
+                imported += result.length;
+            }
+            if (imported) {
+                invalidateCharacterCache(target.key);
+                toastr.success(`已向 ${target.character.name} 导入 ${imported} 个聊天`);
+                await refreshChats();
+                scheduleNativeChatGrouping();
+            } else if (input.files?.length) {
+                toastr.warning('没有导入聊天，请确认文件格式和内容是否有效。');
+            }
+        } catch (error) {
+            console.error('[Chats Manager] Import failed', error);
+            toastr.error(`导入失败：${error.message}`);
+        } finally {
+            input.remove();
+        }
+    }, { once: true });
+    input.click();
+}
+
+async function startNewChatForCharacter() {
+    const target = await chooseTargetCharacter('选择要新建聊天的角色');
+    if (!target) return;
+    await selectCharacterById(target.id);
+    await doNewChat({ deleteCurrentChat: false });
+    browseAllCharacters = false;
+    invalidateCharacterCache(target.key);
+    await refreshChats();
+}
+
+async function openNativeManagerForCharacter() {
+    const target = await chooseTargetCharacter('选择要管理聊天的角色');
+    if (!target) return;
+    await selectCharacterById(target.id);
+    document.getElementById('option_select_chat')?.click();
+}
+
+async function batchMoveChats() {
+    const chats = selectedChats();
+    if (!chats.length) return;
+    const grouped = new Map();
+    for (const chat of chats) {
+        if (!grouped.has(chat.characterKey)) grouped.set(chat.characterKey, []);
+        grouped.get(chat.characterKey).push(chat);
+    }
+    const content = document.createElement('div');
+    const title = document.createElement('h3');
+    title.textContent = '批量移动到分组';
+    content.append(title);
+    for (const [key, roleChats] of grouped) {
+        const row = document.createElement('label');
+        row.className = 'chm-batch-folder-row';
+        const name = document.createElement('span');
+        name.textContent = roleChats[0].character.name;
+        const select = document.createElement('select');
+        select.className = 'text_pole';
+        select.dataset.characterKey = key;
+        const keep = document.createElement('option');
+        keep.value = '__keep__';
+        keep.textContent = '保持原分组';
+        const unfiled = document.createElement('option');
+        unfiled.value = '';
+        unfiled.textContent = '移出分组';
+        select.append(keep, unfiled);
+        for (const folder of getLibrary(key).folders) {
+            const option = document.createElement('option');
+            option.value = folder.id;
+            option.textContent = folder.name;
+            select.append(option);
+        }
+        row.append(name, select);
+        content.append(row);
+    }
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '移动', cancelButton: t`Cancel` });
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+    for (const select of content.querySelectorAll('select[data-character-key]')) {
+        if (select.value === '__keep__') continue;
+        const key = select.dataset.characterKey;
+        const library = getLibrary(key);
+        const entry = getCachedCharacter(key);
+        const rootNames = new Set(grouped.get(key).map(chat => getRootChatName(chat, entry)));
+        for (const rootName of rootNames) {
+            if (select.value) library.chatFolders[rootName] = select.value;
+            else delete library.chatFolders[rootName];
+        }
+    }
+    saveSettings();
+    await refreshChats();
+    scheduleNativeChatGrouping();
+}
+
+function menuAction(icon, label, handler, className = '') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `chm-menu-action ${className}`.trim();
+    button.innerHTML = `<i class="${icon}" aria-hidden="true"></i><span></span>`;
+    button.querySelector('span').textContent = label;
+    button.addEventListener('click', event => {
+        event.stopPropagation();
+        button.closest('details')?.removeAttribute('open');
+        void handler();
+    });
+    return button;
+}
+
+function positionFloatingMenu(details) {
+    const summary = details.querySelector('summary');
+    const popover = details.querySelector('.chm-row-menu-popover');
+    if (!summary || !popover) return;
+    requestAnimationFrame(() => {
+        const anchor = summary.getBoundingClientRect();
+        const menu = popover.getBoundingClientRect();
+        const margin = 8;
+        const left = Math.max(margin, Math.min(anchor.right - menu.width, window.innerWidth - menu.width - margin));
+        const fitsBelow = anchor.bottom + menu.height + margin <= window.innerHeight;
+        const top = fitsBelow ? anchor.bottom + 4 : Math.max(margin, anchor.top - menu.height - 4);
+        popover.style.left = `${left}px`;
+        popover.style.top = `${top}px`;
+    });
+}
+
+function createChatActionsMenu(chat, { depth = 0, descendants = 0 } = {}) {
+    const details = document.createElement('details');
+    details.className = 'chm-row-menu';
+    const summary = document.createElement('summary');
+    summary.className = 'chm-icon-button';
+    summary.title = '更多聊天操作';
+    summary.setAttribute('aria-label', '更多聊天操作');
+    summary.innerHTML = '<i class="fa-solid fa-ellipsis" aria-hidden="true"></i>';
+    const menu = document.createElement('div');
+    menu.className = 'chm-row-menu-popover';
+    menu.append(
+        menuAction(isChatPinned(chat) ? 'fa-solid fa-star' : 'fa-regular fa-star', isChatPinned(chat) ? '取消收藏' : '收藏聊天', async () => {
+            toggleChatPin(chat);
+            await refreshChats();
+        }),
+        menuAction('fa-regular fa-folder-open', depth || descendants ? '移动聊天树' : '移动到分组', () => chooseFolder(chat)),
+        menuAction('fa-solid fa-file-export', '导出 JSONL', () => exportChats([chat], 'jsonl')),
+        menuAction('fa-regular fa-file-lines', '导出 TXT', () => exportChats([chat], 'txt')),
+        menuAction('fa-regular fa-trash-can', '删除聊天', () => deleteChats([chat]), 'chm-menu-danger'),
+    );
+    details.addEventListener('toggle', () => {
+        if (!details.open) return;
+        chatsPanel?.querySelectorAll('.chm-row-menu[open]').forEach(other => {
+            if (other !== details) other.removeAttribute('open');
+        });
+        positionFloatingMenu(details);
+    });
+    details.addEventListener('click', event => event.stopPropagation());
+    details.append(summary, menu);
+    return details;
+}
+
 function renderChatNode(node, container, depth = 0, visibleQuery = '', options = {}) {
     if (!treeMatches(node, visibleQuery)) return;
     const chat = node.chat;
@@ -476,6 +836,7 @@ function renderChatNode(node, container, depth = 0, visibleQuery = '', options =
     row.className = `chm-chat-row${depth ? ' is-branch' : ''}${pinnedCopy ? ' is-pinned-copy' : ''}`;
     row.style.setProperty('--branch-depth', depth);
     row.dataset.chatKey = `${chat.characterKey}::${chat.fileName}`;
+    renderedChats.set(row.dataset.chatKey, chat);
     row.tabIndex = 0;
     row.setAttribute('role', 'button');
     const liveContext = SillyTavern.getContext();
@@ -483,6 +844,7 @@ function renderChatNode(node, container, depth = 0, visibleQuery = '', options =
         row.classList.add('is-current');
     }
     if (isChatPinned(chat)) row.classList.add('is-pinned');
+    if (chatsSelectedChats.has(row.dataset.chatKey)) row.classList.add('is-selected');
 
     const branchRail = document.createElement('div');
     branchRail.className = 'chm-branch-rail';
@@ -535,25 +897,35 @@ function renderChatNode(node, container, depth = 0, visibleQuery = '', options =
 
     const actions = document.createElement('div');
     actions.className = 'chm-row-actions';
-    const pin = iconButton(isChatPinned(chat) ? 'fa-solid fa-star' : 'fa-regular fa-star', isChatPinned(chat) ? '取消收藏聊天' : '收藏并置顶聊天', `chm-pin-chat${isChatPinned(chat) ? ' is-pinned' : ''}`);
-    pin.addEventListener('click', event => {
-        event.stopPropagation();
-        toggleChatPin(chat);
-        void refreshChats();
-    });
-    const move = iconButton('fa-regular fa-folder-open', depth || descendants ? '移动整个聊天树到分组' : '移动到分组');
-    move.addEventListener('click', event => { event.stopPropagation(); void chooseFolder(chat); });
     const rename = iconButton('fa-solid fa-pencil', '重命名聊天');
     rename.addEventListener('click', event => { event.stopPropagation(); void renameChat(chat); });
-    actions.append(pin, move, rename);
+    actions.append(rename, createChatActionsMenu(chat, { depth, descendants }));
     row.append(branchRail);
+    if (chatsBatchMode) {
+        const select = document.createElement('label');
+        select.className = 'chm-batch-select';
+        select.title = `选择 ${chat.fileName}`;
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'chm-batch-checkbox';
+        checkbox.checked = chatsSelectedChats.has(row.dataset.chatKey);
+        checkbox.addEventListener('click', event => event.stopPropagation());
+        checkbox.addEventListener('change', () => setChatSelected(chat, checkbox.checked));
+        select.addEventListener('click', event => event.stopPropagation());
+        select.append(checkbox);
+        row.append(select);
+    }
     if (pinnedCopy) row.append(makeAvatar(chat.character, 'tiny'));
     row.append(main, actions);
-    row.addEventListener('click', () => void openChat(chat));
+    row.addEventListener('click', () => {
+        if (chatsBatchMode) setChatSelected(chat, !chatsSelectedChats.has(row.dataset.chatKey));
+        else void openChat(chat);
+    });
     row.addEventListener('keydown', event => {
         if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
-            void openChat(chat);
+            if (chatsBatchMode) setChatSelected(chat, !chatsSelectedChats.has(row.dataset.chatKey));
+            else void openChat(chat);
         }
     });
     container.append(row);
@@ -769,6 +1141,7 @@ async function refreshChats(force = false) {
     if (focused) activeEntry = await loadCharacterEntry(activeDescriptor, force);
     if (generation !== loadGeneration) return;
     list.replaceChildren();
+    renderedChats.clear();
     updateCharacterViewControls(activeEntry || activeDescriptor, focused);
     if (focused) {
         const matches = !query
@@ -921,7 +1294,33 @@ function makeChatsPanel() {
         invalidateCharacterCache();
         void refreshChats();
     });
-    toolbar.append(searchBox, refresh);
+    const toolbarMenu = document.createElement('details');
+    toolbarMenu.className = 'chm-toolbar-menu';
+    const toolbarMenuToggle = document.createElement('summary');
+    toolbarMenuToggle.className = 'chm-icon-button chm-toolbar-menu-toggle';
+    toolbarMenuToggle.title = '聊天管理功能';
+    toolbarMenuToggle.setAttribute('aria-label', '聊天管理功能');
+    toolbarMenuToggle.innerHTML = '<i class="fa-solid fa-ellipsis" aria-hidden="true"></i>';
+    const toolbarMenuPopover = document.createElement('div');
+    toolbarMenuPopover.className = 'chm-row-menu-popover chm-toolbar-menu-popover';
+    toolbarMenuPopover.append(
+        menuAction('fa-solid fa-plus', '新聊天', () => startNewChatForCharacter()),
+        menuAction('fa-solid fa-file-import', '导入聊天', () => importChatsToCharacter()),
+        menuAction('fa-solid fa-address-book', '打开原生管理器', () => openNativeManagerForCharacter()),
+    );
+    toolbarMenu.addEventListener('click', event => event.stopPropagation());
+    toolbarMenu.addEventListener('toggle', () => {
+        if (toolbarMenu.open) positionFloatingMenu(toolbarMenu);
+    });
+    toolbarMenu.append(toolbarMenuToggle, toolbarMenuPopover);
+    const batchToggle = iconButton('fa-solid fa-pen-to-square', '批量编辑聊天', 'chm-batch-toggle');
+    batchToggle.addEventListener('click', () => {
+        chatsBatchMode = !chatsBatchMode;
+        if (!chatsBatchMode) chatsSelectedChats.clear();
+        void refreshChats();
+        updateChatsBatchUi();
+    });
+    toolbar.append(searchBox, toolbarMenu, batchToggle, refresh);
 
     const controls = document.createElement('div');
     controls.className = 'chm-list-controls';
@@ -984,12 +1383,51 @@ function makeChatsPanel() {
     });
     pagination.append(status, ...pageButtons, pageSize);
     controls.append(viewControls, pagination);
+    const batchBar = document.createElement('div');
+    batchBar.className = 'chm-batch-bar';
+    batchBar.hidden = true;
+    const selectAll = menuAction('fa-solid fa-check-double', '全选当前列表', async () => {
+        const chats = [...renderedChats.values()];
+        const allSelected = chats.length > 0 && chats.every(chat => chatsSelectedChats.has(chatPinKey(chat)));
+        for (const chat of chats) {
+            if (allSelected) chatsSelectedChats.delete(chatPinKey(chat));
+            else chatsSelectedChats.set(chatPinKey(chat), chat);
+        }
+        updateChatsBatchUi();
+    });
+    selectAll.classList.add('chm-batch-select-all');
+    const batchCount = document.createElement('span');
+    batchCount.className = 'chm-batch-count';
+    batchCount.textContent = '已选 0';
+    const pin = menuAction('fa-regular fa-star', '收藏', async () => {
+        const chats = selectedChats();
+        const shouldPin = chats.some(chat => !isChatPinned(chat));
+        chats.forEach(chat => setChatPinned(chat, shouldPin));
+        saveSettings();
+        await refreshChats();
+    });
+    pin.classList.add('chm-batch-pin');
+    const move = menuAction('fa-regular fa-folder-open', '分组', () => batchMoveChats());
+    move.classList.add('chm-batch-move');
+    const jsonl = menuAction('fa-solid fa-file-export', 'JSONL', () => exportChats(selectedChats(), 'jsonl'));
+    const txt = menuAction('fa-regular fa-file-lines', 'TXT', () => exportChats(selectedChats(), 'txt'));
+    const remove = menuAction('fa-regular fa-trash-can', '删除', () => deleteChats(selectedChats()), 'chm-menu-danger');
+    for (const button of [pin, move, jsonl, txt, remove]) button.dataset.requiresSelection = 'true';
+    batchBar.append(selectAll, batchCount, pin, move, jsonl, txt, remove);
     const loading = document.createElement('div');
     loading.className = 'chm-loading';
     loading.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i><span>正在整理聊天…</span>';
     const sections = document.createElement('div');
     sections.className = 'chm-sections';
-    wrapper.append(toolbar, controls, loading, sections);
+    wrapper.append(toolbar, controls, batchBar, loading, sections);
+    wrapper.addEventListener('scroll', () => {
+        wrapper.querySelectorAll('details[open]').forEach(details => details.removeAttribute('open'));
+    }, { passive: true });
+    wrapper.addEventListener('click', event => {
+        if (event.target.closest('details')) return;
+        wrapper.querySelectorAll('details[open]').forEach(details => details.removeAttribute('open'));
+    });
+    queueMicrotask(updateChatsBatchUi);
     return wrapper;
 }
 

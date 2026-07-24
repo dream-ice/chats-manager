@@ -234,6 +234,120 @@
 
 .chm-icon-button.chm-danger:hover { color: var(--SmartThemeDangerColor, #d36a6a); }
 .chm-refresh { width: 34px; height: 34px; border: 1px solid var(--chm-line); opacity: .7; }
+.chm-batch-toggle,
+.chm-toolbar-menu-toggle { width: 34px; height: 34px; border: 1px solid var(--chm-line); opacity: .7; }
+.chm-batch-toggle.is-active {
+    color: var(--chm-accent);
+    background: color-mix(in srgb, var(--chm-accent) 12%, transparent);
+    opacity: 1;
+}
+
+.chm-toolbar-menu,
+.chm-row-menu {
+    position: relative;
+    flex: 0 0 auto;
+}
+
+.chm-toolbar-menu > summary,
+.chm-row-menu > summary {
+    list-style: none;
+}
+
+.chm-toolbar-menu > summary::-webkit-details-marker,
+.chm-row-menu > summary::-webkit-details-marker { display: none; }
+
+.chm-row-menu-popover {
+    position: fixed;
+    z-index: 10020;
+    display: grid;
+    width: max-content;
+    min-width: 150px;
+    padding: 4px;
+    border: 1px solid var(--chm-line);
+    border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor);
+    box-shadow: 0 8px 24px color-mix(in srgb, var(--SmartThemeShadowColor, #000) 34%, transparent);
+    backdrop-filter: blur(calc(var(--SmartThemeBlurStrength) * 1px));
+}
+
+/* WebKit treats fixed children of a backdrop-filter element as locally fixed.
+   Anchor the sticky-toolbar menu to its own ellipsis instead. */
+.chm-toolbar-menu-popover {
+    position: absolute;
+    top: calc(100% + 4px) !important;
+    right: 0;
+    left: auto !important;
+}
+
+details:not([open]) > .chm-row-menu-popover { display: none; }
+
+.chm-menu-action {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    min-height: 32px;
+    margin: 0;
+    padding: 5px 9px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: .82em;
+    text-align: left;
+    cursor: pointer;
+    opacity: .82;
+}
+
+.chm-menu-action:hover,
+.chm-menu-action:focus-visible { background: var(--chm-hover); opacity: 1; }
+.chm-menu-action > i { width: 16px; text-align: center; opacity: .72; }
+.chm-menu-action:disabled { cursor: default; opacity: .24; }
+.chm-menu-danger:not(:disabled):hover { color: var(--SmartThemeDangerColor, #d36a6a); }
+
+.chm-batch-bar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-height: 38px;
+    margin: 0 0 8px;
+    padding: 3px 4px;
+    border: 1px solid var(--chm-line);
+    border-radius: 8px;
+    background: var(--chm-soft);
+}
+
+.chm-batch-bar[hidden] { display: none; }
+.chm-batch-bar.is-busy { pointer-events: none; opacity: .55; }
+.chm-batch-bar .chm-menu-action {
+    justify-content: center;
+    width: auto;
+    min-width: 31px;
+    padding-inline: 7px;
+}
+.chm-batch-count {
+    flex: 1;
+    min-width: 48px;
+    padding-inline: 5px;
+    font-size: .76em;
+    white-space: nowrap;
+    opacity: .66;
+}
+
+.chm-batch-folder-row {
+    display: grid;
+    grid-template-columns: minmax(90px, 1fr) minmax(130px, 1.4fr);
+    align-items: center;
+    gap: 10px;
+    margin-top: 7px;
+}
+.chm-batch-folder-row > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.chm-batch-folder-row > select { width: 100%; margin: 0; }
 
 .chm-loading,
 .chm-empty {
@@ -423,6 +537,29 @@
 .chm-chat-row.is-pinned:not(.is-current) {
     background: color-mix(in srgb, var(--chm-accent) 6%, transparent);
 }
+
+.chm-chat-row.is-selected {
+    background: color-mix(in srgb, var(--chm-accent) 14%, transparent);
+    box-shadow: inset 2px 0 0 var(--chm-accent);
+}
+
+.chm-batch-select {
+    display: grid;
+    place-items: center;
+    align-self: stretch;
+    flex: 0 0 27px;
+    min-height: 42px;
+    cursor: pointer;
+}
+
+.chm-batch-checkbox {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--chm-accent);
+}
+
+.chm-tab-panel.is-batch-mode .chm-row-actions { display: none; }
 
 .chm-branch-rail { display: none; }
 
@@ -674,6 +811,10 @@
 .chm-native-folder-list > .select_chat_block_wrapper:not(.chm-native-branch) { width: 100%; }
 
 @media (max-width: 700px) {
+    .chm-batch-bar { justify-content: space-between; }
+    .chm-batch-bar .chm-menu-action { flex: 0 0 31px; padding-inline: 5px; }
+    .chm-batch-bar .chm-menu-action span { display: none; }
+    .chm-batch-count { flex: 1; }
     .chm-native-batch-toolbar { flex-wrap: nowrap; }
     .chm-native-batch-actions {
         width: 100%;
