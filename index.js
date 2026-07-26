@@ -774,17 +774,19 @@ function menuAction(icon, label, handler, className = '') {
     button.querySelector('span').textContent = label;
     button.addEventListener('click', event => {
         event.stopPropagation();
-        button.closest('details')?.removeAttribute('open');
+        const popover = button.closest('.chm-row-menu-popover');
+        const owner = button.closest('details') || popover?._chmOwnerDetails;
+        owner?.removeAttribute('open');
         void handler();
     });
     return button;
 }
 
-function positionFloatingMenu(details) {
+function positionFloatingMenu(details, popover = details.querySelector('.chm-row-menu-popover')) {
     const summary = details.querySelector('summary');
-    const popover = details.querySelector('.chm-row-menu-popover');
     if (!summary || !popover) return;
     requestAnimationFrame(() => {
+        if (!details.open || !popover.isConnected) return;
         const anchor = summary.getBoundingClientRect();
         const menu = popover.getBoundingClientRect();
         const margin = 8;
@@ -793,6 +795,25 @@ function positionFloatingMenu(details) {
         const top = fitsBelow ? anchor.bottom + 4 : Math.max(margin, anchor.top - menu.height - 4);
         popover.style.left = `${left}px`;
         popover.style.top = `${top}px`;
+    });
+}
+
+function setupFloatingMenu(details, popover) {
+    popover._chmOwnerDetails = details;
+    details.addEventListener('toggle', () => {
+        if (!details.open) {
+            popover.classList.remove('is-portaled');
+            popover.style.removeProperty('left');
+            popover.style.removeProperty('top');
+            details.append(popover);
+            return;
+        }
+        chatsPanel?.querySelectorAll('details[open]').forEach(other => {
+            if (other !== details) other.removeAttribute('open');
+        });
+        document.body.append(popover);
+        popover.classList.add('is-portaled');
+        positionFloatingMenu(details, popover);
     });
 }
 
@@ -816,13 +837,7 @@ function createChatActionsMenu(chat, { depth = 0, descendants = 0 } = {}) {
         menuAction('fa-regular fa-file-lines', '导出 TXT', () => exportChats([chat], 'txt')),
         menuAction('fa-regular fa-trash-can', '删除聊天', () => deleteChats([chat]), 'chm-menu-danger'),
     );
-    details.addEventListener('toggle', () => {
-        if (!details.open) return;
-        chatsPanel?.querySelectorAll('.chm-row-menu[open]').forEach(other => {
-            if (other !== details) other.removeAttribute('open');
-        });
-        positionFloatingMenu(details);
-    });
+    setupFloatingMenu(details, menu);
     details.addEventListener('click', event => event.stopPropagation());
     details.append(summary, menu);
     return details;
@@ -1309,9 +1324,7 @@ function makeChatsPanel() {
         menuAction('fa-solid fa-address-book', '打开原生管理器', () => openNativeManagerForCharacter()),
     );
     toolbarMenu.addEventListener('click', event => event.stopPropagation());
-    toolbarMenu.addEventListener('toggle', () => {
-        if (toolbarMenu.open) positionFloatingMenu(toolbarMenu);
-    });
+    setupFloatingMenu(toolbarMenu, toolbarMenuPopover);
     toolbarMenu.append(toolbarMenuToggle, toolbarMenuPopover);
     const batchToggle = iconButton('fa-solid fa-pen-to-square', '批量编辑聊天', 'chm-batch-toggle');
     batchToggle.addEventListener('click', () => {

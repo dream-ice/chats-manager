@@ -272,11 +272,17 @@
 
 /* WebKit treats fixed children of a backdrop-filter element as locally fixed.
    Anchor the sticky-toolbar menu to its own ellipsis instead. */
-.chm-toolbar-menu-popover {
+.chm-toolbar-menu-popover:not(.is-portaled) {
     position: absolute;
     top: calc(100% + 4px) !important;
     right: 0;
     left: auto !important;
+}
+
+.chm-row-menu-popover.is-portaled {
+    position: fixed !important;
+    right: auto !important;
+    max-width: calc(100vw - 16px);
 }
 
 details:not([open]) > .chm-row-menu-popover { display: none; }
