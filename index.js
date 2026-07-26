@@ -785,24 +785,23 @@ function menuAction(icon, label, handler, className = '') {
 function positionFloatingMenu(details, popover = details.querySelector('.chm-row-menu-popover')) {
     const summary = details.querySelector('summary');
     if (!summary || !popover) return;
-    requestAnimationFrame(() => {
-        if (!details.open || !popover.isConnected) return;
-        const anchor = summary.getBoundingClientRect();
-        const menu = popover.getBoundingClientRect();
-        const margin = 8;
-        const left = Math.max(margin, Math.min(anchor.right - menu.width, window.innerWidth - menu.width - margin));
-        const fitsBelow = anchor.bottom + menu.height + margin <= window.innerHeight;
-        const top = fitsBelow ? anchor.bottom + 4 : Math.max(margin, anchor.top - menu.height - 4);
-        popover.style.left = `${left}px`;
-        popover.style.top = `${top}px`;
-    });
+    if (!details.open || !popover.isConnected) return;
+    const anchor = summary.getBoundingClientRect();
+    const menu = popover.getBoundingClientRect();
+    const margin = 8;
+    const left = Math.max(margin, Math.min(anchor.right - menu.width, window.innerWidth - menu.width - margin));
+    const fitsBelow = anchor.bottom + menu.height + margin <= window.innerHeight;
+    const top = fitsBelow ? anchor.bottom + 4 : Math.max(margin, anchor.top - menu.height - 4);
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    popover.classList.remove('is-positioning');
 }
 
 function setupFloatingMenu(details, popover) {
     popover._chmOwnerDetails = details;
     details.addEventListener('toggle', () => {
         if (!details.open) {
-            popover.classList.remove('is-portaled');
+            popover.classList.remove('is-portaled', 'is-positioning');
             popover.style.removeProperty('left');
             popover.style.removeProperty('top');
             details.append(popover);
@@ -811,8 +810,8 @@ function setupFloatingMenu(details, popover) {
         chatsPanel?.querySelectorAll('details[open]').forEach(other => {
             if (other !== details) other.removeAttribute('open');
         });
+        popover.classList.add('is-portaled', 'is-positioning');
         document.body.append(popover);
-        popover.classList.add('is-portaled');
         positionFloatingMenu(details, popover);
     });
 }
