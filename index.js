@@ -33,7 +33,16 @@ let activateTab = null;
 let loadGeneration = 0;
 const characterChatCache = new Map();
 const pendingCharacterLoads = new Map();
+const pendingCharacterDetails = new Map();
 const CHAT_LOAD_CONCURRENCY = 4;
+const CHAT_SUMMARY_TIMEOUT_MS = 8000;
+const CHAT_DETAIL_TIMEOUT_MS = 120000;
+const CHAT_INDEX_TIMEOUT_MS = 30000;
+const CHAT_DETAIL_RETRY_MS = 60000;
+const CHAT_DETAIL_CONCURRENCY = 2;
+let detailRefreshTimer = null;
+let activeDetailLoads = 0;
+const detailLoadWaiters = [];
 let characterCacheEpoch = 0;
 let currentPage = 1;
 let browseAllCharacters = false;
@@ -156,6 +165,10 @@ function characterKey(character) {
     return String(character?.avatar || character?.name || 'unknown');
 }
 
+function getCharacterName(character) {
+    return String(character?.name || '未命名角色');
+}
+
 function currentChatName() {
     return chatName(SillyTavern.getContext().getCurrentChatId?.());
 }
@@ -199,16 +212,24 @@ function chatPreview(value, limit = 96) {
     return text.length > limit ? `${text.slice(0, limit).trimEnd()}…` : text;
 }
 
-async function fetchCharacterChats(character, id) {
+async function fetchCharacterChats(character, id, { simple = false } = {}) {
+    const controller = new AbortController();
+    const timeoutMs = simple ? CHAT_SUMMARY_TIMEOUT_MS : CHAT_DETAIL_TIMEOUT_MS;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
         const response = await fetch('/api/characters/chats', {
             method: 'POST',
             headers: getRequestHeaders(),
-            body: JSON.stringify({ avatar_url: character.avatar, metadata: true }),
+            body: JSON.stringify({
+                avatar_url: character.avatar,
+                simple,
+                metadata: !simple,
+            }),
+            signal: controller.signal,
         });
-        if (!response.ok) return [];
+        if (!response.ok) return null;
         const data = await response.json();
-        if (!Array.isArray(data) && (typeof data !== 'object' || data.error)) return [];
+        if (!Array.isArray(data) && (typeof data !== 'object' || data.error)) return null;
         return Object.values(data).filter(item => item?.file_name).map(item => ({
             id,
             character,
@@ -220,8 +241,11 @@ async function fetchCharacterChats(character, id) {
             metadata: item.chat_metadata || {},
         }));
     } catch (error) {
-        console.warn('[Chats Manager] Failed to load chats for', character?.name, error);
-        return [];
+        const reason = error?.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : error;
+        console.warn(`[Chats Manager] Failed to load ${simple ? 'chat names' : 'chat details'} for`, getCharacterName(character), reason);
+        return null;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -248,9 +272,91 @@ function invalidateCharacterCache(characterKeyValue = '') {
     else pendingCharacterLoads.clear();
 }
 
+function queueCharacterDetailsRefresh() {
+    clearTimeout(detailRefreshTimer);
+    detailRefreshTimer = setTimeout(() => {
+        if (chatsPanel && !chatsPanel.hidden) void refreshChats();
+        scheduleNativeChatGrouping();
+    }, 150);
+}
+
+async function acquireDetailLoadSlot() {
+    if (activeDetailLoads < CHAT_DETAIL_CONCURRENCY) {
+        activeDetailLoads++;
+        return;
+    }
+    await new Promise(resolve => detailLoadWaiters.push(resolve));
+}
+
+function releaseDetailLoadSlot() {
+    const next = detailLoadWaiters.shift();
+    if (next) next();
+    else activeDetailLoads = Math.max(0, activeDetailLoads - 1);
+}
+
+function scheduleCharacterDetails(descriptor, requestEpoch = characterCacheEpoch) {
+    const cached = getCachedCharacter(descriptor.key);
+    if (!cached?.isSummary || pendingCharacterDetails.has(descriptor.key)) return;
+    if (Number(cached.detailRetryAfter) > Date.now()) return;
+    cached.detailState = 'loading';
+    const request = (async () => {
+        await acquireDetailLoadSlot();
+        try {
+            if (characterCacheEpoch !== requestEpoch) return;
+            const chats = await fetchCharacterChats(descriptor.character, descriptor.id);
+            if (characterCacheEpoch !== requestEpoch) return;
+            const current = getCachedCharacter(descriptor.key);
+            if (!current?.isSummary) return;
+            if (chats) {
+                characterChatCache.set(descriptor.key, {
+                    ...descriptor,
+                    chats,
+                    isSummary: false,
+                    detailState: 'ready',
+                });
+            } else {
+                characterChatCache.set(descriptor.key, {
+                    ...current,
+                    detailState: 'deferred',
+                    detailRetryAfter: Date.now() + CHAT_DETAIL_RETRY_MS,
+                });
+            }
+            queueCharacterDetailsRefresh();
+        } finally {
+            releaseDetailLoadSlot();
+        }
+    })().catch(error => {
+        console.error('[Chats Manager] Failed to enrich chat details for', getCharacterName(descriptor.character), error);
+        const current = getCachedCharacter(descriptor.key);
+        if (current?.isSummary) {
+            characterChatCache.set(descriptor.key, {
+                ...current,
+                detailState: 'deferred',
+                detailRetryAfter: Date.now() + CHAT_DETAIL_RETRY_MS,
+            });
+            queueCharacterDetailsRefresh();
+        }
+    });
+    pendingCharacterDetails.set(descriptor.key, request);
+    void request.finally(() => {
+        if (pendingCharacterDetails.get(descriptor.key) === request) {
+            pendingCharacterDetails.delete(descriptor.key);
+        }
+        const current = getCachedCharacter(descriptor.key);
+        if (current?.isSummary && Number(current.detailRetryAfter || 0) <= Date.now()) {
+            scheduleCharacterDetails({
+                id: current.id,
+                key: current.key,
+                character: current.character,
+            }, characterCacheEpoch);
+        }
+    });
+}
+
 async function loadCharacterEntry(descriptor, force = false) {
     const cached = getCachedCharacter(descriptor.key);
     if (cached && !force) {
+        if (cached.isSummary) scheduleCharacterDetails(descriptor);
         return { ...cached, id: descriptor.id, character: descriptor.character };
     }
     if (!force && pendingCharacterLoads.has(descriptor.key)) {
@@ -259,12 +365,16 @@ async function loadCharacterEntry(descriptor, force = false) {
     const requestEpoch = characterCacheEpoch;
     let request;
     request = (async () => {
+        const chats = await fetchCharacterChats(descriptor.character, descriptor.id, { simple: true });
         const entry = {
             ...descriptor,
-            chats: await fetchCharacterChats(descriptor.character, descriptor.id),
+            chats: chats || [],
+            isSummary: true,
+            detailState: 'loading',
         };
         if (characterCacheEpoch === requestEpoch && pendingCharacterLoads.get(descriptor.key) === request) {
             characterChatCache.set(descriptor.key, entry);
+            scheduleCharacterDetails(descriptor, requestEpoch);
         }
         return entry;
     })();
@@ -287,8 +397,18 @@ async function loadCharacterEntries(descriptors, force = false) {
         }
     };
     const workerCount = Math.min(CHAT_LOAD_CONCURRENCY, unique.length);
-    await Promise.all(Array.from({ length: workerCount }, worker));
-    return results;
+    const workers = Promise.all(Array.from({ length: workerCount }, worker));
+    let deadline;
+    const indexDeadline = new Promise(resolve => {
+        deadline = setTimeout(resolve, CHAT_INDEX_TIMEOUT_MS);
+    });
+    await Promise.race([workers, indexDeadline]);
+    clearTimeout(deadline);
+    const completed = results.filter(Boolean);
+    if (completed.length < unique.length) {
+        console.warn(`[Chats Manager] Chat index deadline reached; showing ${completed.length}/${unique.length} loaded characters.`);
+    }
+    return completed;
 }
 
 function resolveChatAlias(characterKeyValue, value) {
@@ -384,7 +504,7 @@ async function validateBackToParentButton() {
 
 function treeMatches(node, query) {
     if (!query) return true;
-    const haystack = `${node.chat.character.name} ${node.chat.fileName} ${node.chat.message}`.toLocaleLowerCase();
+    const haystack = `${getCharacterName(node.chat.character)} ${node.chat.fileName} ${node.chat.message}`.toLocaleLowerCase();
     return haystack.includes(query) || node.children.some(child => treeMatches(child, query));
 }
 
@@ -556,7 +676,7 @@ async function exportChats(chats, format) {
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(data?.message || `无法导出 ${chat.fileName}`);
-            const downloadName = chats.length > 1 ? `${chat.character.name} - ${fileName}` : fileName;
+            const downloadName = chats.length > 1 ? `${getCharacterName(chat.character)} - ${fileName}` : fileName;
             download(data.result, downloadName, format === 'txt' ? 'text/plain' : 'application/octet-stream');
             exported++;
         }
@@ -621,7 +741,7 @@ async function deleteChats(chats) {
 }
 
 async function chooseTargetCharacter(title) {
-    const descriptors = getCharacterDescriptors().sort((a, b) => a.character.name.localeCompare(b.character.name));
+    const descriptors = getCharacterDescriptors().sort((a, b) => getCharacterName(a.character).localeCompare(getCharacterName(b.character)));
     if (!descriptors.length) return null;
     const focusedKey = chatsPanel?.dataset.focusCharacterKey || '';
     if (focusedKey) return descriptors.find(item => item.key === focusedKey) || null;
@@ -634,7 +754,7 @@ async function chooseTargetCharacter(title) {
     for (const descriptor of descriptors) {
         const option = document.createElement('option');
         option.value = descriptor.key;
-        option.textContent = descriptor.character.name;
+        option.textContent = getCharacterName(descriptor.character);
         option.selected = descriptor.key === activeKey;
         select.append(option);
     }
@@ -673,13 +793,13 @@ async function importChatsToCharacter() {
                 formData.set('avatar', file);
                 formData.set('avatar_url', target.character.avatar);
                 formData.set('user_name', SillyTavern.getContext().name1 || 'User');
-                formData.set('character_name', target.character.name || 'Character');
+                formData.set('character_name', getCharacterName(target.character));
                 const result = await importCharacterChat(formData, { refresh: false });
                 imported += result.length;
             }
             if (imported) {
                 invalidateCharacterCache(target.key);
-                toastr.success(`已向 ${target.character.name} 导入 ${imported} 个聊天`);
+                toastr.success(`已向 ${getCharacterName(target.character)} 导入 ${imported} 个聊天`);
                 await refreshChats();
                 scheduleNativeChatGrouping();
             } else if (input.files?.length) {
@@ -728,7 +848,7 @@ async function batchMoveChats() {
         const row = document.createElement('label');
         row.className = 'chm-batch-folder-row';
         const name = document.createElement('span');
-        name.textContent = roleChats[0].character.name;
+        name.textContent = getCharacterName(roleChats[0].character);
         const select = document.createElement('select');
         select.className = 'text_pole';
         select.dataset.characterKey = key;
@@ -870,8 +990,8 @@ function renderChatNode(node, container, depth = 0, visibleQuery = '', options =
     if (pinnedCopy) {
         const characterName = document.createElement('span');
         characterName.className = 'chm-pinned-character';
-        characterName.textContent = chat.character.name;
-        characterName.title = chat.character.name;
+        characterName.textContent = getCharacterName(chat.character);
+        characterName.title = getCharacterName(chat.character);
         titleLine.append(characterName);
     }
     if (depth || (pinnedCopy && chat.metadata?.main_chat)) {
@@ -989,6 +1109,38 @@ function renderFolderSection(entry, folder, roots, query, container) {
 function createCharacterBody(entry, query) {
     const body = document.createElement('div');
     body.className = 'chm-character-body';
+    if (entry.isSummary) {
+        const status = document.createElement('div');
+        status.className = `chm-detail-status${entry.detailState === 'deferred' ? ' is-deferred' : ''}`;
+        const icon = document.createElement('i');
+        icon.className = entry.detailState === 'deferred'
+            ? 'fa-solid fa-circle-exclamation'
+            : 'fa-solid fa-circle-notch fa-spin';
+        icon.setAttribute('aria-hidden', 'true');
+        const text = document.createElement('span');
+        text.textContent = entry.detailState === 'deferred'
+            ? '聊天名称已加载，预览与分支详情稍后重试'
+            : '聊天名称已加载，正在后台补充分支与预览…';
+        status.append(icon, text);
+        if (entry.detailState === 'deferred') {
+            const retry = iconButton('fa-solid fa-rotate', '立即重试详情加载');
+            retry.addEventListener('click', event => {
+                event.stopPropagation();
+                const cached = getCachedCharacter(entry.key);
+                if (!cached?.isSummary) return;
+                cached.detailRetryAfter = 0;
+                cached.detailState = 'loading';
+                scheduleCharacterDetails({
+                    id: entry.id,
+                    key: entry.key,
+                    character: entry.character,
+                });
+                void refreshChats();
+            });
+            status.append(retry);
+        }
+        body.append(status);
+    }
     const roots = buildChatTree(entry.chats).filter(root => treeMatches(root, query));
     const library = getLibrary(entry.key);
     const byFolder = new Map(library.folders.map(folder => [folder.id, []]));
@@ -1033,7 +1185,7 @@ function renderCharacterSection(entry, query, container) {
     const identity = document.createElement('div');
     identity.className = 'chm-character-identity';
     const name = document.createElement('strong');
-    name.textContent = entry.character.name;
+    name.textContent = getCharacterName(entry.character);
     const summary = document.createElement('span');
     summary.textContent = pluralCount(entry.chats.length);
     identity.append(name, summary);
@@ -1056,7 +1208,7 @@ function renderFocusedCharacter(entry, query, container) {
 
 function chatMatchesQuery(chat, query) {
     if (!query) return true;
-    return `${chat.character.name} ${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query);
+    return `${getCharacterName(chat.character)} ${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query);
 }
 
 function renderPinnedSection(entries, query, container) {
@@ -1106,7 +1258,7 @@ function updateCharacterViewControls(activeEntry, focused) {
     toggle.hidden = !activeEntry;
     if (!activeEntry) return;
     toggle.dataset.target = focused ? 'all' : 'current';
-    toggle.title = focused ? '返回全部角色聊天' : `只看 ${activeEntry.character.name} 的聊天`;
+    toggle.title = focused ? '返回全部角色聊天' : `只看 ${getCharacterName(activeEntry.character)} 的聊天`;
     toggle.innerHTML = focused
         ? '<i class="fa-solid fa-arrow-left" aria-hidden="true"></i><span>全部角色</span>'
         : '<i class="fa-solid fa-user" aria-hidden="true"></i><span>当前角色</span>';
@@ -1147,6 +1299,7 @@ async function refreshChats(force = false) {
     if (!list || !loading) return;
     loading.hidden = false;
     list.classList.add('is-loading');
+    try {
     const descriptors = getCharacterDescriptors();
     const activeKey = getActiveCharacterKey();
     const activeDescriptor = activeKey ? descriptors.find(entry => entry.key === activeKey) : null;
@@ -1159,7 +1312,7 @@ async function refreshChats(force = false) {
     updateCharacterViewControls(activeEntry || activeDescriptor, focused);
     if (focused) {
         const matches = !query
-            || activeEntry.character.name.toLocaleLowerCase().includes(query)
+            || getCharacterName(activeEntry.character).toLocaleLowerCase().includes(query)
             || activeEntry.chats.some(chat => `${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query));
         updatePagination(matches ? 1 : 0, 0, matches ? 1 : 0, 1);
         if (matches) {
@@ -1172,8 +1325,6 @@ async function refreshChats(force = false) {
             empty.innerHTML = '<i class="fa-regular fa-comments"></i><span>当前角色没有匹配的聊天</span>';
             list.append(empty);
         }
-        loading.hidden = true;
-        list.classList.remove('is-loading');
         return;
     }
     const candidates = descriptors.filter(likelyHasChats);
@@ -1188,12 +1339,12 @@ async function refreshChats(force = false) {
         const characters = (await loadCharacterEntries(candidates, force)).filter(entry => entry.chats.length > 0);
         if (generation !== loadGeneration) return;
         visible = characters.filter(entry => !query
-            || entry.character.name.toLocaleLowerCase().includes(query)
+            || getCharacterName(entry.character).toLocaleLowerCase().includes(query)
             || entry.chats.some(chat => `${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query)));
         const sorters = {
-            recent: (a, b) => entryTimestamp(b) - entryTimestamp(a) || a.character.name.localeCompare(b.character.name),
-            name: (a, b) => a.character.name.localeCompare(b.character.name),
-            chats: (a, b) => b.chats.length - a.chats.length || a.character.name.localeCompare(b.character.name),
+            recent: (a, b) => entryTimestamp(b) - entryTimestamp(a) || getCharacterName(a.character).localeCompare(getCharacterName(b.character)),
+            name: (a, b) => getCharacterName(a.character).localeCompare(getCharacterName(b.character)),
+            chats: (a, b) => b.chats.length - a.chats.length || getCharacterName(a.character).localeCompare(getCharacterName(b.character)),
         };
         visible.sort(sorters[settings().sortMode] || sorters.recent);
         const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
@@ -1205,9 +1356,9 @@ async function refreshChats(force = false) {
     } else {
         const sorted = [...candidates];
         if (settings().sortMode === 'name') {
-            sorted.sort((a, b) => a.character.name.localeCompare(b.character.name));
+            sorted.sort((a, b) => getCharacterName(a.character).localeCompare(getCharacterName(b.character)));
         } else {
-            sorted.sort((a, b) => descriptorTimestamp(b) - descriptorTimestamp(a) || a.character.name.localeCompare(b.character.name));
+            sorted.sort((a, b) => descriptorTimestamp(b) - descriptorTimestamp(a) || getCharacterName(a.character).localeCompare(getCharacterName(b.character)));
         }
         const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
         currentPage = Math.min(Math.max(1, currentPage), totalPages);
@@ -1224,14 +1375,38 @@ async function refreshChats(force = false) {
     }
     renderPinnedSection(pinnedEntries, query, list);
     for (const entry of pageEntries) renderCharacterSection(entry, query, list);
-    if (!visible.length) {
+    if (!visible.length || (!pageEntries.length && !pinnedEntries.length)) {
         const empty = document.createElement('div');
         empty.className = 'chm-empty';
-        empty.innerHTML = '<i class="fa-regular fa-comments"></i><span>没有找到聊天</span>';
+        empty.innerHTML = visible.length
+            ? '<i class="fa-solid fa-triangle-exclamation"></i><span>当前页的聊天暂时无法读取，请点击刷新重试</span>'
+            : '<i class="fa-regular fa-comments"></i><span>没有找到聊天</span>';
         list.append(empty);
     }
-    loading.hidden = true;
-    list.classList.remove('is-loading');
+    } catch (error) {
+        if (generation !== loadGeneration) return;
+        console.error('[Chats Manager] Failed to refresh chat list', error);
+        renderedChats.clear();
+        const failure = document.createElement('div');
+        failure.className = 'chm-empty chm-load-error';
+        const message = document.createElement('span');
+        message.textContent = '聊天列表加载失败';
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'menu_button';
+        retry.innerHTML = '<i class="fa-solid fa-rotate" aria-hidden="true"></i><span>重试</span>';
+        retry.addEventListener('click', () => {
+            invalidateCharacterCache();
+            void refreshChats(true);
+        });
+        failure.append(message, retry);
+        list.replaceChildren(failure);
+    } finally {
+        if (generation === loadGeneration) {
+            loading.hidden = true;
+            list.classList.remove('is-loading');
+        }
+    }
 }
 
 function updatePagination(total, start, displayed, totalPages) {

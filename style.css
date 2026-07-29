@@ -370,6 +370,21 @@ details:not([open]) > .chm-row-menu-popover { display: none; }
 
 .chm-loading[hidden] { display: none; }
 .chm-sections.is-loading { opacity: .38; pointer-events: none; }
+.chm-load-error { flex-direction: column; }
+.chm-load-error .menu_button { min-width: 88px; }
+
+.chm-detail-status {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 30px;
+    padding: 4px 9px;
+    font-size: .76em;
+    opacity: .58;
+}
+.chm-detail-status > span { flex: 1; min-width: 0; }
+.chm-detail-status.is-deferred { opacity: .72; }
+.chm-detail-status .chm-icon-button { width: 27px; height: 27px; }
 
 .chm-character-section {
     margin: 0 0 9px;
