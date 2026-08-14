@@ -12,7 +12,7 @@ import {
 import { extension_settings } from '../../../extensions.js';
 import { t } from '../../../i18n.js';
 import { Popup, POPUP_RESULT, POPUP_TYPE } from '../../../popup.js';
-import { download, timestampToMoment } from '../../../utils.js';
+import { download, getStringHash, humanFileSize, timestampToMoment } from '../../../utils.js';
 
 const MODULE_NAME = 'chatsManager';
 const ROOT_ID = 'chats-manager-root';
@@ -30,6 +30,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 let panel = null;
 let chatsPanel = null;
 let activateTab = null;
+let refreshBackups = null;
 let loadGeneration = 0;
 const characterChatCache = new Map();
 const pendingCharacterLoads = new Map();
@@ -39,7 +40,16 @@ const CHAT_SUMMARY_TIMEOUT_MS = 8000;
 const CHAT_DETAIL_TIMEOUT_MS = 120000;
 const CHAT_INDEX_TIMEOUT_MS = 30000;
 const CHAT_DETAIL_RETRY_MS = 60000;
-const CHAT_DETAIL_CONCURRENCY = 2;
+const CHAT_DETAIL_CONCURRENCY = 1;
+const CHAT_AUTO_DETAIL_MAX_BYTES = 256 * 1024 * 1024;
+const CHAT_AUTO_DETAIL_MAX_FILES = 80;
+const CHAT_PREVIEW_CACHE_LIMIT = 512;
+const BACKUP_PAGE_SIZE = 50;
+const BACKUP_PREVIEW_HEAD_BYTES = 512 * 1024;
+const BACKUP_PREVIEW_TAIL_BYTES = 1024 * 1024;
+const BACKUP_PREVIEW_SIDE_MAX = 20;
+const BACKUP_IDENTITY_MAX_BYTES = 32 * 1024;
+const BACKUP_HISTORY_DEFAULT_PAGE_SIZE = 20;
 let detailRefreshTimer = null;
 let activeDetailLoads = 0;
 const detailLoadWaiters = [];
@@ -212,6 +222,11 @@ function chatPreview(value, limit = 96) {
     return text.length > limit ? `${text.slice(0, limit).trimEnd()}…` : text;
 }
 
+function compactChatPreview(value) {
+    const text = String(value ?? '');
+    return text.length > CHAT_PREVIEW_CACHE_LIMIT ? text.slice(0, CHAT_PREVIEW_CACHE_LIMIT) : text;
+}
+
 async function fetchCharacterChats(character, id, { simple = false } = {}) {
     const controller = new AbortController();
     const timeoutMs = simple ? CHAT_SUMMARY_TIMEOUT_MS : CHAT_DETAIL_TIMEOUT_MS;
@@ -235,10 +250,14 @@ async function fetchCharacterChats(character, id, { simple = false } = {}) {
             character,
             characterKey: characterKey(character),
             fileName: chatName(item.file_name),
-            message: item.mes || '',
+            message: compactChatPreview(item.mes),
             itemCount: Number(item.chat_items) || 0,
             lastMessage: item.last_mes || 0,
-            metadata: item.chat_metadata || {},
+            metadata: {
+                ...(item.chat_metadata?.main_chat ? { main_chat: item.chat_metadata.main_chat } : {}),
+                ...(item.chat_metadata?.integrity ? { integrity: item.chat_metadata.integrity } : {}),
+                ...(item.chat_metadata?.chat_id_hash ? { chat_id_hash: item.chat_metadata.chat_id_hash } : {}),
+            },
         }));
     } catch (error) {
         const reason = error?.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : error;
@@ -275,7 +294,7 @@ function invalidateCharacterCache(characterKeyValue = '') {
 function queueCharacterDetailsRefresh() {
     clearTimeout(detailRefreshTimer);
     detailRefreshTimer = setTimeout(() => {
-        if (chatsPanel && !chatsPanel.hidden) void refreshChats();
+        if (chatsPanel && !chatsPanel.hidden) void refreshChats(false, { background: true });
         scheduleNativeChatGrouping();
     }, 150);
 }
@@ -294,9 +313,23 @@ function releaseDetailLoadSlot() {
     else activeDetailLoads = Math.max(0, activeDetailLoads - 1);
 }
 
-function scheduleCharacterDetails(descriptor, requestEpoch = characterCacheEpoch) {
+function characterDetailPolicy(entry) {
+    const bytes = Math.max(0, Number(entry?.character?.chat_size) || 0);
+    const files = Array.isArray(entry?.chats) ? entry.chats.length : 0;
+    return {
+        bytes,
+        files,
+        automatic: bytes <= CHAT_AUTO_DETAIL_MAX_BYTES && files <= CHAT_AUTO_DETAIL_MAX_FILES,
+    };
+}
+
+function scheduleCharacterDetails(descriptor, requestEpoch = characterCacheEpoch, { manual = false } = {}) {
     const cached = getCachedCharacter(descriptor.key);
     if (!cached?.isSummary || pendingCharacterDetails.has(descriptor.key)) return;
+    if (!manual && !characterDetailPolicy(cached).automatic) {
+        cached.detailState = 'manual';
+        return;
+    }
     if (Number(cached.detailRetryAfter) > Date.now()) return;
     cached.detailState = 'loading';
     const request = (async () => {
@@ -815,6 +848,878 @@ async function importChatsToCharacter() {
     input.click();
 }
 
+function parseBackupName(name) {
+    const match = String(name).match(/^chat_(.+)_(\d{8})-(\d{6})\.jsonl$/i);
+    if (!match) return { source: '其他备份', timestamp: 0 };
+    const [, source, date, time] = match;
+    const timestamp = new Date(
+        Number(date.slice(0, 4)),
+        Number(date.slice(4, 6)) - 1,
+        Number(date.slice(6, 8)),
+        Number(time.slice(0, 2)),
+        Number(time.slice(2, 4)),
+        Number(time.slice(4, 6)),
+    ).getTime();
+    return { source, timestamp };
+}
+
+function backupSourceLabel(source) {
+    const normalized = String(source).toLowerCase();
+    const descriptor = getCharacterDescriptors().find(item => {
+        const avatar = String(item.character.avatar || '').replace(/\.[^.]+$/i, '').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        return avatar === normalized;
+    });
+    return descriptor ? getCharacterName(descriptor.character) : source;
+}
+
+async function fetchBackupFile(name) {
+    const response = await fetch('/api/backups/chat/download', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error(`无法读取备份 ${name}`);
+    return response;
+}
+
+async function downloadBackup(name) {
+    try {
+        const response = await fetchBackupFile(name);
+        const blob = await response.blob();
+        const anchor = document.createElement('a');
+        anchor.href = URL.createObjectURL(blob);
+        anchor.download = name;
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(anchor.href), 1000);
+    } catch (error) {
+        console.error('[Chats Manager] Backup download failed', error);
+        toastr.error(error.message);
+    }
+}
+
+async function fetchBackupTextRange(name, range, maxBytes) {
+    const headers = getRequestHeaders();
+    if (range) headers.Range = range;
+    const response = await fetch('/api/backups/chat/download', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error(`无法读取备份 ${name}（HTTP ${response.status}）`);
+    if (!response.body) return { text: '', partial: false, complete: true };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    let complete = false;
+    try {
+        while (bytes < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) {
+                complete = true;
+                break;
+            }
+            const remaining = maxBytes - bytes;
+            text += decoder.decode(value.subarray(0, remaining), { stream: true });
+            bytes += Math.min(value.byteLength, remaining);
+            if (value.byteLength >= remaining) break;
+        }
+        text += decoder.decode();
+    } finally {
+        await reader.cancel().catch(() => {});
+    }
+    return { text, partial: response.status === 206, complete };
+}
+
+function parsePreviewLines(text, { dropFirst = false } = {}) {
+    const lines = text.split('\n');
+    if (dropFirst) lines.shift();
+    return lines.flatMap(line => {
+        try {
+            const item = JSON.parse(line);
+            return item?.mes ? [item] : [];
+        } catch {
+            return [];
+        }
+    });
+}
+
+async function readBackupPreview(name) {
+    const [headResult, tailResult] = await Promise.allSettled([
+        fetchBackupTextRange(name, `bytes=0-${BACKUP_PREVIEW_HEAD_BYTES - 1}`, BACKUP_PREVIEW_HEAD_BYTES),
+        fetchBackupTextRange(name, `bytes=-${BACKUP_PREVIEW_TAIL_BYTES}`, BACKUP_PREVIEW_TAIL_BYTES),
+    ]);
+    // Some SillyTavern versions or reverse proxies reject byte ranges on POST downloads.
+    // Fall back to a capped normal read so one failed tail request never blocks the preview.
+    const head = headResult.status === 'fulfilled'
+        ? headResult.value
+        : await fetchBackupTextRange(name, '', BACKUP_PREVIEW_HEAD_BYTES);
+    const first = parsePreviewLines(head.text).slice(0, BACKUP_PREVIEW_SIDE_MAX);
+    let last = [];
+    let tailAvailable = false;
+    if (tailResult.status === 'fulfilled') {
+        const tail = tailResult.value;
+        tailAvailable = tail.partial || tail.complete;
+        if (tailAvailable) {
+            last = (tail.partial ? parsePreviewLines(tail.text, { dropFirst: true }) : parsePreviewLines(tail.text)).slice(-BACKUP_PREVIEW_SIDE_MAX);
+        }
+    } else if (head.complete) {
+        tailAvailable = true;
+        last = parsePreviewLines(head.text).slice(-BACKUP_PREVIEW_SIDE_MAX);
+    } else {
+        console.warn('[Chats Manager] Backup tail preview unavailable', name, tailResult.reason);
+    }
+    return { first, last, tailAvailable };
+}
+
+async function viewBackup(backupOrName) {
+    const backup = typeof backupOrName === 'string' ? { file_name: backupOrName } : backupOrName;
+    const name = backup.file_name;
+    try {
+        const { first, last, tailAvailable } = await readBackupPreview(name);
+        const content = document.createElement('div');
+        content.className = 'chm-backup-preview';
+        const heading = document.createElement('div');
+        heading.className = 'chm-backup-preview-heading';
+        const identity = document.createElement('div');
+        identity.className = 'chm-backup-preview-identity';
+        const title = document.createElement('strong');
+        title.textContent = '备份内容预览';
+        const note = document.createElement('span');
+        note.textContent = `${formatDate(backup.last_mes || parseBackupName(name).timestamp)} · ${backup.chat_items ?? '?'} 条消息`;
+        identity.append(title, note);
+        const controls = document.createElement('div');
+        controls.className = 'chm-backup-preview-controls';
+        const makeCountSelect = (label, value = '5') => {
+            const wrapper = document.createElement('label');
+            wrapper.append(`${label} `);
+            const select = document.createElement('select');
+            select.className = 'text_pole';
+            for (const count of [3, 5, 10, 20]) select.add(new Option(`${count} 楼`, String(count)));
+            select.value = value;
+            wrapper.append(select);
+            return { wrapper, select };
+        };
+        const headCount = makeCountSelect('开头');
+        const tailCount = makeCountSelect('结尾');
+        controls.append(headCount.wrapper, tailCount.wrapper);
+        heading.append(identity, controls);
+        const body = document.createElement('div');
+        body.className = 'chm-backup-preview-body';
+        const renderMessages = () => {
+            const startItems = first.slice(0, Number(headCount.select.value));
+            const endItems = last.slice(-Number(tailCount.select.value));
+            const seen = new Set(startItems.map(item => `${item.send_date || ''}\u0000${item.name || ''}\u0000${item.mes}`));
+            const uniqueEnd = endItems.filter(item => !seen.has(`${item.send_date || ''}\u0000${item.name || ''}\u0000${item.mes}`));
+            body.replaceChildren();
+            const appendMessage = (item, indexLabel) => {
+                const article = document.createElement('article');
+                article.className = 'chm-backup-preview-message';
+                const meta = document.createElement('header');
+                const speaker = document.createElement('strong');
+                speaker.textContent = item.name || '未知发言者';
+                const floor = document.createElement('span');
+                floor.textContent = `${indexLabel} · ${formatDate(item.send_date)}`;
+                meta.append(speaker, floor);
+                const message = document.createElement('div');
+                message.className = 'chm-backup-preview-message-text';
+                message.textContent = item.mes;
+                article.append(meta, message);
+                body.append(article);
+            };
+            startItems.forEach((item, index) => appendMessage(item, `前 ${index + 1}`));
+            if (uniqueEnd.length || !tailAvailable) {
+                const gap = document.createElement('div');
+                gap.className = 'chm-backup-preview-gap';
+                gap.innerHTML = tailAvailable
+                    ? '<i class="fa-solid fa-ellipsis"></i><span>中间内容未加载</span>'
+                    : '<i class="fa-solid fa-triangle-exclamation"></i><span>服务器未提供文件尾分段读取</span>';
+                body.append(gap);
+                uniqueEnd.forEach((item, index) => appendMessage(item, `后 ${uniqueEnd.length - index}`));
+            }
+            if (!startItems.length && !uniqueEnd.length) {
+                const empty = document.createElement('div');
+                empty.className = 'chm-backups-empty';
+                empty.textContent = '没有可预览的消息';
+                body.append(empty);
+            }
+        };
+        headCount.select.addEventListener('change', renderMessages);
+        tailCount.select.addEventListener('change', renderMessages);
+        renderMessages();
+        content.append(heading, body);
+        const popup = new Popup(content, POPUP_TYPE.DISPLAY, '', { wide: true });
+        await popup.show();
+    } catch (error) {
+        console.error('[Chats Manager] Backup preview failed', error);
+        toastr.error(error.message);
+    }
+}
+
+async function restoreBackup(name, source, presetTarget = null) {
+    const descriptors = getCharacterDescriptors().sort((a, b) => getCharacterName(a.character).localeCompare(getCharacterName(b.character)));
+    if (!descriptors.length) return toastr.error('没有可用于恢复备份的角色。');
+    let target = presetTarget ? descriptors.find(item => item.key === presetTarget.key) : null;
+    const content = document.createElement('div');
+    const title = document.createElement('h3');
+    title.textContent = '恢复备份为新聊天';
+    const note = document.createElement('p');
+    note.className = 'chm-popup-note';
+    note.textContent = target
+        ? `将恢复到“${getCharacterName(target.character)}”的聊天列表，并生成一份新聊天；当前聊天不会被覆盖。`
+        : '恢复会导入一份新聊天，不会覆盖当前聊天。请确认目标角色。';
+    content.append(title, note);
+    let select = null;
+    if (!target) {
+        select = document.createElement('select');
+        select.className = 'text_pole wide100p';
+        const normalized = String(source).toLowerCase();
+        for (const descriptor of descriptors) {
+            const option = document.createElement('option');
+            option.value = descriptor.key;
+            option.textContent = getCharacterName(descriptor.character);
+            const avatar = String(descriptor.character.avatar || '').replace(/\.[^.]+$/i, '').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+            option.selected = avatar === normalized;
+            select.append(option);
+        }
+        content.append(select);
+    }
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '恢复', cancelButton: t`Cancel` });
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+    if (!target) target = descriptors.find(item => item.key === select?.value);
+    if (!target) return;
+    try {
+        const response = await fetchBackupFile(name);
+        const file = new File([await response.blob()], name, { type: 'application/octet-stream' });
+        const formData = new FormData();
+        formData.set('file_type', 'jsonl');
+        formData.set('avatar', file);
+        formData.set('avatar_url', target.character.avatar);
+        formData.set('user_name', SillyTavern.getContext().name1 || 'User');
+        formData.set('character_name', getCharacterName(target.character));
+        const result = await importCharacterChat(formData, { refresh: false });
+        if (!result.length) throw new Error('酒馆没有返回已恢复的聊天文件');
+        invalidateCharacterCache(target.key);
+        if (chatsPanel && !chatsPanel.hidden) await refreshChats();
+        toastr.success(`已恢复到 ${getCharacterName(target.character)}：${result.join('、')}`);
+    } catch (error) {
+        console.error('[Chats Manager] Backup restore failed', error);
+        toastr.error(`恢复失败：${error.message}`);
+    }
+}
+
+async function deleteBackups(names, { confirm = true } = {}) {
+    if (!names.length) return [];
+    if (confirm) {
+        const content = document.createElement('div');
+        const title = document.createElement('h3');
+        title.textContent = names.length === 1 ? '删除这个聊天备份？' : `删除选中的 ${names.length} 个聊天备份？`;
+        const note = document.createElement('p');
+        note.className = 'chm-popup-note';
+        note.textContent = '备份文件会被永久删除，此操作无法撤销。原聊天不会受到影响。';
+        content.append(title, note);
+        const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '删除', cancelButton: t`Cancel` });
+        if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return [];
+    }
+    const deleted = [];
+    for (const name of names) {
+        try {
+            const response = await fetch('/api/backups/chat/delete', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({ name }),
+            });
+            if (response.ok) deleted.push(name);
+        } catch (error) {
+            console.error('[Chats Manager] Backup delete failed', name, error);
+        }
+    }
+    if (deleted.length) toastr.success(`已删除 ${deleted.length} 个聊天备份`);
+    if (deleted.length !== names.length) toastr.warning(`${names.length - deleted.length} 个备份删除失败`);
+    return deleted;
+}
+
+async function downloadBackupsAsZip(backups) {
+    if (!backups.length) return;
+    const totalBytes = backups.reduce((sum, backup) => sum + parseBackupSize(backup.file_size), 0);
+    if (totalBytes > 256 * 1024 * 1024) {
+        toastr.warning('所选备份超过 256 MiB。为避免浏览器内存溢出，请分批选择，或逐个下载原始文件。');
+        return;
+    }
+    try {
+        if (!globalThis.JSZip) await import('../../../../lib/jszip.min.js');
+        if (!globalThis.JSZip) throw new Error('ZIP 组件不可用');
+        const zip = new globalThis.JSZip();
+        let completed = 0;
+        for (const backup of backups) {
+            const response = await fetchBackupFile(backup.file_name);
+            zip.file(backup.file_name, await response.blob());
+            completed++;
+            toastr.info(`正在准备备份压缩包：${completed}/${backups.length}`, '', { timeOut: 800, preventDuplicates: true });
+        }
+        const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 3 } });
+        const anchor = document.createElement('a');
+        anchor.href = URL.createObjectURL(blob);
+        anchor.download = `chat-backups-${new Date().toISOString().slice(0, 10)}.zip`;
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(anchor.href), 1000);
+    } catch (error) {
+        console.error('[Chats Manager] Backup ZIP failed', error);
+        toastr.error(`批量下载失败：${error.message}`);
+    }
+}
+
+function parseBackupSize(value) {
+    const match = String(value || '').trim().match(/^([\d.]+)\s*(B|KB|KiB|MB|MiB|GB|GiB)?$/i);
+    if (!match) return 0;
+    const unit = (match[2] || 'B').toUpperCase();
+    const factor = unit.startsWith('G') ? 1024 ** 3 : unit.startsWith('M') ? 1024 ** 2 : unit.startsWith('K') ? 1024 : 1;
+    return Number(match[1]) * factor;
+}
+
+async function openBackupManager() {
+    const content = document.createElement('div');
+    content.className = 'chm-backup-manager';
+    content.innerHTML = `
+        <div class="chm-backup-heading">
+            <div><h3>聊天备份</h3><p>查看酒馆自动生成的聊天快照。只有打开这里时才会读取备份目录。</p></div>
+            <span class="chm-backup-status" aria-live="polite"></span>
+        </div>
+        <div class="chm-backup-toolbar">
+            <label class="chm-search chm-backup-search"><i class="fa-solid fa-magnifying-glass"></i><input class="text_pole" type="search" placeholder="搜索来源或文件名…" aria-label="搜索聊天备份"></label>
+            <select class="text_pole chm-backup-source" aria-label="筛选备份来源"><option value="">全部来源</option></select>
+            <button type="button" class="chm-icon-button chm-backup-refresh" title="刷新备份列表" aria-label="刷新备份列表"><i class="fa-solid fa-rotate"></i></button>
+        </div>
+        <div class="chm-backup-batch">
+            <label class="checkbox_label"><input type="checkbox" class="chm-backup-select-page"><span>本页全选</span></label>
+            <span class="chm-backup-selected">已选 0</span>
+            <button type="button" class="menu_button chm-backup-zip" disabled><i class="fa-solid fa-file-zipper"></i><span>打包下载</span></button>
+            <button type="button" class="menu_button chm-backup-delete-selected" disabled><i class="fa-regular fa-trash-can"></i><span>删除</span></button>
+        </div>
+        <div class="chm-backup-list" aria-live="polite"></div>
+        <div class="chm-backup-pagination"></div>`;
+
+    const status = content.querySelector('.chm-backup-status');
+    const search = content.querySelector('.chm-backup-search input');
+    const sourceSelect = content.querySelector('.chm-backup-source');
+    const selectPage = content.querySelector('.chm-backup-select-page');
+    const selectedLabel = content.querySelector('.chm-backup-selected');
+    const zipButton = content.querySelector('.chm-backup-zip');
+    const deleteButton = content.querySelector('.chm-backup-delete-selected');
+    const list = content.querySelector('.chm-backup-list');
+    const pagination = content.querySelector('.chm-backup-pagination');
+    const selected = new Set();
+    let backups = [];
+    let page = 1;
+    let loading = false;
+    const controller = new AbortController();
+
+    const filteredBackups = () => {
+        const term = search.value.trim().toLowerCase();
+        return backups.filter(backup => {
+            const parsed = parseBackupName(backup.file_name);
+            const source = backupSourceLabel(parsed.source);
+            return (!sourceSelect.value || parsed.source === sourceSelect.value)
+                && (!term || backup.file_name.toLowerCase().includes(term) || source.toLowerCase().includes(term));
+        });
+    };
+
+    const updateBatch = pageItems => {
+        const selectedItems = backups.filter(item => selected.has(item.file_name));
+        selectedLabel.textContent = `已选 ${selectedItems.length}`;
+        zipButton.disabled = deleteButton.disabled = selectedItems.length === 0 || loading;
+        selectPage.disabled = pageItems.length === 0 || loading;
+        selectPage.checked = pageItems.length > 0 && pageItems.every(item => selected.has(item.file_name));
+        selectPage.indeterminate = !selectPage.checked && pageItems.some(item => selected.has(item.file_name));
+    };
+
+    const render = () => {
+        const filtered = filteredBackups();
+        const pageCount = Math.max(1, Math.ceil(filtered.length / BACKUP_PAGE_SIZE));
+        page = Math.min(page, pageCount);
+        const pageItems = filtered.slice((page - 1) * BACKUP_PAGE_SIZE, page * BACKUP_PAGE_SIZE);
+        list.replaceChildren();
+        if (!pageItems.length) {
+            const empty = document.createElement('div');
+            empty.className = 'chm-empty-state';
+            empty.textContent = loading ? '正在整理备份…' : backups.length ? '没有符合条件的备份' : '没有找到聊天备份';
+            list.append(empty);
+        }
+        for (const backup of pageItems) {
+            const parsed = parseBackupName(backup.file_name);
+            const row = document.createElement('div');
+            row.className = 'chm-backup-row';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = selected.has(backup.file_name);
+            checkbox.setAttribute('aria-label', `选择 ${backup.file_name}`);
+            checkbox.addEventListener('change', () => {
+                checkbox.checked ? selected.add(backup.file_name) : selected.delete(backup.file_name);
+                updateBatch(pageItems);
+            });
+            const main = document.createElement('div');
+            main.className = 'chm-backup-main';
+            const name = document.createElement('strong');
+            name.className = 'chm-backup-name';
+            name.textContent = backupSourceLabel(parsed.source);
+            name.title = backup.file_name;
+            const meta = document.createElement('span');
+            meta.className = 'chm-backup-meta';
+            meta.textContent = `${formatDate(backup.last_mes || parsed.timestamp)} · ${backup.file_size || '未知大小'} · ${backup.chat_items ?? '?'} 条消息`;
+            main.append(name, meta);
+            const actions = document.createElement('div');
+            actions.className = 'chm-backup-actions';
+            const action = (icon, title, handler, danger = false) => {
+                const button = iconButton(icon, title, danger ? 'chm-backup-danger' : '');
+                button.addEventListener('click', handler);
+                return button;
+            };
+            actions.append(
+                action('fa-regular fa-eye', '查看有限预览', () => viewBackup(backup.file_name)),
+                action('fa-solid fa-download', '下载原始备份', () => downloadBackup(backup.file_name)),
+                action('fa-solid fa-rotate-left', '恢复为新聊天', () => restoreBackup(backup.file_name, parsed.source)),
+                action('fa-regular fa-trash-can', '删除备份', async () => {
+                    const deleted = await deleteBackups([backup.file_name]);
+                    if (deleted.length) {
+                        backups = backups.filter(item => !deleted.includes(item.file_name));
+                        for (const name of deleted) selected.delete(name);
+                        render();
+                    }
+                }, true),
+            );
+            row.append(checkbox, main, actions);
+            list.append(row);
+        }
+        status.textContent = loading ? '读取中…' : `${filtered.length} 个备份`;
+        pagination.replaceChildren();
+        const previous = iconButton('fa-solid fa-chevron-left', '上一页', 'chm-backup-page-button');
+        const next = iconButton('fa-solid fa-chevron-right', '下一页', 'chm-backup-page-button');
+        previous.disabled = page <= 1;
+        next.disabled = page >= pageCount;
+        previous.addEventListener('click', () => { page--; render(); });
+        next.addEventListener('click', () => { page++; render(); });
+        const pageLabel = document.createElement('span');
+        pageLabel.textContent = `${page} / ${pageCount}`;
+        pagination.append(previous, pageLabel, next);
+        updateBatch(pageItems);
+    };
+
+    const load = async () => {
+        if (loading) return;
+        loading = true;
+        render();
+        try {
+            const response = await fetch('/api/backups/chat/get', { method: 'POST', headers: getRequestHeaders(), signal: controller.signal });
+            if (!response.ok) throw new Error('无法读取聊天备份列表');
+            backups = await response.json();
+            backups.sort((a, b) => (parseBackupName(b.file_name).timestamp || Date.parse(b.last_mes) || 0) - (parseBackupName(a.file_name).timestamp || Date.parse(a.last_mes) || 0));
+            selected.clear();
+            sourceSelect.replaceChildren(new Option('全部来源', ''));
+            const sources = [...new Set(backups.map(item => parseBackupName(item.file_name).source))]
+                .sort((a, b) => backupSourceLabel(a).localeCompare(backupSourceLabel(b)));
+            for (const source of sources) sourceSelect.add(new Option(backupSourceLabel(source), source));
+        } catch (error) {
+            if (error.name !== 'AbortError') {
+                console.error('[Chats Manager] Backup list failed', error);
+                toastr.error(error.message);
+            }
+        } finally {
+            loading = false;
+            render();
+        }
+    };
+
+    search.addEventListener('input', () => { page = 1; render(); });
+    sourceSelect.addEventListener('change', () => { page = 1; render(); });
+    content.querySelector('.chm-backup-refresh').addEventListener('click', load);
+    selectPage.addEventListener('change', () => {
+        const filtered = filteredBackups();
+        const pageItems = filtered.slice((page - 1) * BACKUP_PAGE_SIZE, page * BACKUP_PAGE_SIZE);
+        for (const item of pageItems) selectPage.checked ? selected.add(item.file_name) : selected.delete(item.file_name);
+        render();
+    });
+    zipButton.addEventListener('click', () => downloadBackupsAsZip(backups.filter(item => selected.has(item.file_name))));
+    deleteButton.addEventListener('click', async () => {
+        const names = [...selected];
+        const deletedNames = await deleteBackups(names);
+        if (deletedNames.length) {
+            const deleted = new Set(deletedNames);
+            backups = backups.filter(item => !deleted.has(item.file_name));
+            for (const name of deleted) selected.delete(name);
+            render();
+        }
+    });
+
+    render();
+    const popup = new Popup(content, POPUP_TYPE.DISPLAY, '', { large: true, wide: true });
+    const shown = popup.show();
+    void load();
+    await shown;
+    controller.abort();
+}
+
+async function readBackupIdentity(backup, signal) {
+    const response = await fetch('/api/backups/chat/download', {
+        method: 'POST',
+        headers: { ...getRequestHeaders(), Range: `bytes=0-${BACKUP_IDENTITY_MAX_BYTES - 1}` },
+        body: JSON.stringify({ name: backup.file_name }),
+        signal,
+    });
+    if (!response.ok) throw new Error(`无法识别备份 ${backup.file_name}`);
+    const reader = response.body?.getReader();
+    if (!reader) return { identity: '', chatHash: '' };
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    try {
+        while (bytes < BACKUP_IDENTITY_MAX_BYTES) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const remaining = BACKUP_IDENTITY_MAX_BYTES - bytes;
+            text += decoder.decode(value.subarray(0, remaining), { stream: true });
+            bytes += Math.min(value.byteLength, remaining);
+            if (value.byteLength >= remaining) break;
+        }
+    } finally {
+        await reader.cancel().catch(() => {});
+    }
+    const integrity = text.match(/"integrity"\s*:\s*"([^"\\]+)"/)?.[1];
+    const hashMatch = text.match(/"chat_id_hash"\s*:\s*(?:"([^"\\]+)"|(\d+))/);
+    const chatHash = hashMatch?.[1] || hashMatch?.[2] || '';
+    return { identity: integrity || chatHash, chatHash };
+}
+
+async function identifyBackups(backups, signal, onProgress) {
+    let nextIndex = 0;
+    let completed = 0;
+    const worker = async () => {
+        while (nextIndex < backups.length) {
+            const index = nextIndex++;
+            const backup = backups[index];
+            try {
+                const identity = await readBackupIdentity(backup, signal);
+                backup.chatIdentity = identity.identity;
+                backup.chatHash = identity.chatHash;
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                console.warn('[Chats Manager] Backup identity unavailable', backup.file_name, error);
+                backup.chatIdentity = '';
+            }
+            completed++;
+            onProgress?.(completed, backups.length);
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, backups.length) }, worker));
+    return backups;
+}
+
+function groupBackupsByChat(backups) {
+    const groups = new Map();
+    for (const backup of backups) {
+        const parsed = parseBackupName(backup.file_name);
+        const identity = backup.chatIdentity || backup.file_name;
+        const key = `${parsed.source}::${identity}`;
+        if (!groups.has(key)) groups.set(key, { key, source: parsed.source, identity, backups: [] });
+        groups.get(key).backups.push(backup);
+    }
+    return [...groups.values()].map(group => {
+        group.backups.sort((a, b) => parseBackupName(b.file_name).timestamp - parseBackupName(a.file_name).timestamp);
+        group.latest = group.backups[0];
+        group.chatHash = group.backups.find(backup => backup.chatHash)?.chatHash || '';
+        group.timestamp = parseBackupName(group.latest.file_name).timestamp;
+        group.totalBytes = group.backups.reduce((sum, backup) => sum + parseBackupSize(backup.file_size), 0);
+        return group;
+    }).sort((a, b) => b.timestamp - a.timestamp);
+}
+
+function closeChatBackups() {
+    const view = chatsPanel?.querySelector('.chm-chat-backups-view');
+    if (!view) return;
+    view._chmDispose?.();
+    view.remove();
+    chatsPanel.classList.remove('is-backup-detail');
+    for (const child of chatsPanel.children) {
+        child.hidden = child.dataset.backupWasHidden === 'true';
+        delete child.dataset.backupWasHidden;
+    }
+    refreshBackups = null;
+    chatsPanel.scrollTop = 0;
+}
+
+function openChatBackups(chat) {
+    closeChatBackups();
+    for (const child of chatsPanel.children) {
+        child.dataset.backupWasHidden = String(child.hidden);
+        child.hidden = true;
+    }
+    chatsPanel.classList.add('is-backup-detail');
+    const view = makeBackupsPanel(chat);
+    chatsPanel.append(view);
+    chatsPanel.scrollTop = 0;
+    void refreshBackups?.(true);
+}
+
+function makeBackupsPanel(targetChat) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'chm-chat-backups-view';
+    wrapper.innerHTML = `
+        <div class="chm-backups-sticky">
+            <div class="chm-toolbar chm-backups-toolbar">
+                <button type="button" class="chm-icon-button chm-backups-back" title="返回聊天列表" aria-label="返回聊天列表"><i class="fa-solid fa-arrow-left"></i></button>
+                <div class="chm-backups-title"><strong></strong><span class="chm-backups-count">历史备份</span></div>
+                <button type="button" class="chm-icon-button chm-backups-batch-toggle" title="批量管理这条聊天的备份" aria-label="批量管理这条聊天的备份"><i class="fa-solid fa-pen-to-square"></i></button>
+                <button type="button" class="chm-icon-button chm-backups-refresh" title="刷新这条聊天的备份" aria-label="刷新这条聊天的备份"><i class="fa-solid fa-rotate"></i></button>
+            </div>
+            <div class="chm-backups-tools">
+                <label class="chm-search"><i class="fa-solid fa-magnifying-glass"></i><input class="text_pole chm-backups-search" type="search" placeholder="搜索时间、文件名或末条内容…" aria-label="搜索这条聊天的备份"></label>
+                <div class="chm-pagination chm-backups-pagination"></div>
+            </div>
+        </div>
+        <div class="chm-batch-bar chm-backups-batchbar" hidden>
+            <button type="button" class="chm-menu-action chm-backups-select-page"><i class="fa-solid fa-check-double"></i><span>全选本页</span></button>
+            <span class="chm-batch-count chm-backups-selected">已选 0</span>
+            <button type="button" class="chm-menu-action chm-backups-download-selected" disabled><i class="fa-solid fa-file-zipper"></i><span>打包下载</span></button>
+            <button type="button" class="chm-menu-action chm-menu-danger chm-backups-delete-selected" disabled><i class="fa-regular fa-trash-can"></i><span>删除</span></button>
+            <button type="button" class="chm-menu-action chm-backups-exit-batch"><i class="fa-solid fa-xmark"></i><span>退出</span></button>
+        </div>
+        <div class="chm-backups-list"></div>`;
+
+    wrapper.querySelector('.chm-backups-title strong').textContent = targetChat.fileName;
+    const search = wrapper.querySelector('.chm-backups-search');
+    const count = wrapper.querySelector('.chm-backups-count');
+    const batchbar = wrapper.querySelector('.chm-backups-batchbar');
+    const selectedLabel = wrapper.querySelector('.chm-backups-selected');
+    const downloadSelected = wrapper.querySelector('.chm-backups-download-selected');
+    const deleteSelected = wrapper.querySelector('.chm-backups-delete-selected');
+    const list = wrapper.querySelector('.chm-backups-list');
+    const pagination = wrapper.querySelector('.chm-backups-pagination');
+    const selected = new Set();
+    let groups = [];
+    let page = 1;
+    let pageSize = BACKUP_HISTORY_DEFAULT_PAGE_SIZE;
+    let batchMode = false;
+    let loaded = false;
+    let loading = false;
+    let loadController = null;
+    wrapper._chmDispose = () => loadController?.abort();
+
+    const allBackups = () => groups.flatMap(group => group.backups)
+        .sort((a, b) => parseBackupName(b.file_name).timestamp - parseBackupName(a.file_name).timestamp);
+    const visibleBackups = () => {
+        const query = search.value.trim().toLocaleLowerCase();
+        if (!query) return allBackups();
+        return allBackups().filter(backup => {
+            const parsed = parseBackupName(backup.file_name);
+            const haystack = `${backup.file_name} ${formatDate(parsed.timestamp)} ${formatDate(backup.last_mes)} ${backup.mes || ''}`.toLocaleLowerCase();
+            return haystack.includes(query);
+        });
+    };
+
+    const updateBatchbar = pageBackups => {
+        batchbar.hidden = !batchMode;
+        wrapper.classList.toggle('is-batch-mode', batchMode);
+        selectedLabel.textContent = `已选 ${selected.size}`;
+        downloadSelected.disabled = deleteSelected.disabled = !selected.size || loading;
+        wrapper.querySelector('.chm-backups-select-page').disabled = !pageBackups.length || loading;
+    };
+
+    const render = () => {
+        const filtered = visibleBackups();
+        const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+        page = Math.min(page, pageCount);
+        const pageBackups = filtered.slice((page - 1) * pageSize, page * pageSize);
+        list.replaceChildren();
+        if (!pageBackups.length) {
+            const empty = document.createElement('div');
+            empty.className = 'chm-backups-empty';
+            empty.innerHTML = loading
+                ? '<i class="fa-solid fa-spinner fa-spin"></i><span>正在整理聊天备份…</span>'
+                : `<i class="fa-regular fa-clock"></i><span>${loaded ? (allBackups().length ? '没有匹配的备份' : '没有找到这个聊天的备份') : '进入后才会读取这条聊天的备份'}</span>`;
+            list.append(empty);
+        }
+        for (const backup of pageBackups) {
+            const parsed = parseBackupName(backup.file_name);
+            const row = document.createElement('div');
+            row.className = 'chm-backup-history-row';
+            if (batchMode) {
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'chm-backup-history-select';
+                checkbox.checked = selected.has(backup.file_name);
+                checkbox.setAttribute('aria-label', `选择 ${backup.file_name}`);
+                checkbox.addEventListener('change', () => {
+                    checkbox.checked ? selected.add(backup.file_name) : selected.delete(backup.file_name);
+                    updateBatchbar(pageBackups);
+                });
+                row.append(checkbox);
+            }
+            const icon = document.createElement('span');
+            icon.className = 'chm-backup-history-icon';
+            icon.innerHTML = '<i class="fa-solid fa-clock-rotate-left"></i>';
+            const main = document.createElement('div');
+            main.className = 'chm-backup-history-main';
+            const headline = document.createElement('div');
+            headline.className = 'chm-backup-history-headline';
+            const date = document.createElement('strong');
+            date.textContent = formatDate(parsed.timestamp);
+            const meta = document.createElement('span');
+            meta.textContent = `${backup.file_size || '未知大小'} · ${backup.chat_items ?? '?'} 条消息`;
+            headline.append(date, meta);
+            const preview = document.createElement('span');
+            preview.className = 'chm-backup-history-preview';
+            preview.textContent = chatPreview(backup.mes, 110) || '这个备份没有末条消息预览';
+            preview.title = String(backup.mes || '').replace(/\s+/g, ' ').trim();
+            main.append(headline, preview);
+            const actions = document.createElement('span');
+            actions.className = 'chm-backup-history-actions';
+            const action = (iconName, label, handler, className = '') => {
+                const button = iconButton(iconName, label, className);
+                button.addEventListener('click', handler);
+                return button;
+            };
+            actions.append(
+                action('fa-regular fa-eye', '预览开头和结尾', () => viewBackup(backup)),
+                action('fa-solid fa-download', '下载原始备份', () => downloadBackup(backup.file_name)),
+                action('fa-solid fa-rotate-left', '恢复为新聊天', () => restoreBackup(backup.file_name, parsed.source, {
+                    key: targetChat.characterKey,
+                    character: targetChat.character,
+                })),
+                action('fa-regular fa-trash-can', '删除备份', async () => {
+                    const deleted = await deleteBackups([backup.file_name]);
+                    if (!deleted.length) return;
+                    selected.delete(backup.file_name);
+                    const deletedSet = new Set(deleted);
+                    for (const group of groups) group.backups = group.backups.filter(item => !deletedSet.has(item.file_name));
+                    groups = groupBackupsByChat(groups.flatMap(group => group.backups));
+                    render();
+                }, 'chm-backup-danger'),
+            );
+            row.append(icon, main, actions);
+            list.append(row);
+        }
+        count.textContent = loading
+            ? '正在识别聊天备份…'
+            : search.value.trim() ? `${filtered.length} / ${allBackups().length} 份备份` : `${filtered.length} 份备份`;
+        pagination.replaceChildren();
+        const status = document.createElement('span');
+        status.className = 'chm-page-status';
+        status.textContent = filtered.length ? `${(page - 1) * pageSize + 1}-${Math.min(page * pageSize, filtered.length)} / ${filtered.length}` : '0 / 0';
+        const pageButtons = [
+            ['first', 'fa-solid fa-angles-left', '第一页'],
+            ['previous', 'fa-solid fa-angle-left', '上一页'],
+            ['next', 'fa-solid fa-angle-right', '下一页'],
+            ['last', 'fa-solid fa-angles-right', '最后一页'],
+        ].map(([direction, iconName, label]) => {
+            const button = iconButton(iconName, label, 'chm-page-button');
+            button.disabled = ['first', 'previous'].includes(direction) ? page <= 1 : page >= pageCount;
+            button.addEventListener('click', () => {
+                if (direction === 'first') page = 1;
+                if (direction === 'previous') page = Math.max(1, page - 1);
+                if (direction === 'next') page = Math.min(pageCount, page + 1);
+                if (direction === 'last') page = pageCount;
+                render();
+                chatsPanel.scrollTop = 0;
+            });
+            return button;
+        });
+        const size = createSelect('chm-page-size chm-backups-page-size', '每页显示备份数', [10, 20, 30, 50].map(value => ({ value: String(value), label: `${value} / 页` })), pageSize);
+        size.addEventListener('change', () => {
+            pageSize = Number(size.value);
+            page = 1;
+            render();
+        });
+        pagination.append(status, ...pageButtons, size);
+        updateBatchbar(pageBackups);
+    };
+
+    refreshBackups = async (force = false) => {
+        if (loading || (loaded && !force)) return;
+        loadController?.abort();
+        loadController = new AbortController();
+        loading = true;
+        selected.clear();
+        render();
+        try {
+            const response = await fetch('/api/backups/chat/get', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                signal: loadController.signal,
+            });
+            if (!response.ok) throw new Error('无法读取聊天备份列表');
+            const source = String(targetChat.character?.avatar || '')
+                .replace(/\.[^.]+$/i, '')
+                .replace(/[^a-z0-9]/gi, '_')
+                .toLowerCase();
+            const backupList = await response.json();
+            const backups = backupList.filter(backup => parseBackupName(backup.file_name).source.toLowerCase() === source);
+            await identifyBackups(backups, loadController.signal, (done, total) => {
+                count.textContent = `正在识别聊天… ${done}/${total}`;
+            });
+            const integrity = targetChat.metadata?.integrity || '';
+            const candidateHashes = new Set([
+                targetChat.metadata?.chat_id_hash,
+                getStringHash(targetChat.fileName),
+                targetChat.metadata?.main_chat ? getStringHash(targetChat.metadata.main_chat) : '',
+                ...Object.entries(getLibrary(targetChat.characterKey).chatAliases)
+                    .filter(([, currentName]) => currentName === targetChat.fileName)
+                    .map(([oldName]) => getStringHash(oldName)),
+            ].filter(Boolean).map(String));
+            groups = groupBackupsByChat(backups).filter(group => (
+                integrity ? group.identity === integrity : candidateHashes.has(String(group.chatHash))
+            ));
+            loaded = true;
+            page = 1;
+        } catch (error) {
+            if (error.name !== 'AbortError') {
+                console.error('[Chats Manager] Backup page failed', error);
+                toastr.error(error.message);
+            }
+        } finally {
+            loading = false;
+            render();
+        }
+    };
+
+    wrapper.querySelector('.chm-backups-back').addEventListener('click', closeChatBackups);
+    search.addEventListener('input', () => {
+        page = 1;
+        render();
+    });
+    wrapper.querySelector('.chm-backups-refresh').addEventListener('click', () => void refreshBackups(true));
+    wrapper.querySelector('.chm-backups-batch-toggle').addEventListener('click', () => {
+        batchMode = !batchMode;
+        if (!batchMode) selected.clear();
+        render();
+    });
+    wrapper.querySelector('.chm-backups-exit-batch').addEventListener('click', () => {
+        batchMode = false;
+        selected.clear();
+        render();
+    });
+    wrapper.querySelector('.chm-backups-select-page').addEventListener('click', () => {
+        const filtered = visibleBackups();
+        const pageBackups = filtered.slice((page - 1) * pageSize, page * pageSize);
+        const names = pageBackups.map(backup => backup.file_name);
+        const shouldSelect = names.some(name => !selected.has(name));
+        for (const name of names) shouldSelect ? selected.add(name) : selected.delete(name);
+        render();
+    });
+    downloadSelected.addEventListener('click', () => {
+        const backups = groups.flatMap(group => group.backups).filter(backup => selected.has(backup.file_name));
+        void downloadBackupsAsZip(backups);
+    });
+    deleteSelected.addEventListener('click', async () => {
+        const deleted = new Set(await deleteBackups([...selected]));
+        if (!deleted.size) return;
+        selected.forEach(name => { if (deleted.has(name)) selected.delete(name); });
+        for (const group of groups) group.backups = group.backups.filter(backup => !deleted.has(backup.file_name));
+        groups = groupBackupsByChat(groups.flatMap(group => group.backups));
+        render();
+    });
+    render();
+    return wrapper;
+}
+
 async function startNewChatForCharacter() {
     const target = await chooseTargetCharacter('选择要新建聊天的角色');
     if (!target) return;
@@ -927,7 +1832,7 @@ function setupFloatingMenu(details, popover) {
             details.append(popover);
             return;
         }
-        chatsPanel?.querySelectorAll('details[open]').forEach(other => {
+        chatsPanel?.querySelectorAll('details.chm-row-menu[open], details.chm-toolbar-menu[open]').forEach(other => {
             if (other !== details) other.removeAttribute('open');
         });
         popover.classList.add('is-portaled', 'is-positioning');
@@ -1033,7 +1938,9 @@ function renderChatNode(node, container, depth = 0, visibleQuery = '', options =
     actions.className = 'chm-row-actions';
     const rename = iconButton('fa-solid fa-pencil', '重命名聊天');
     rename.addEventListener('click', event => { event.stopPropagation(); void renameChat(chat); });
-    actions.append(rename, createChatActionsMenu(chat, { depth, descendants }));
+    const backups = iconButton('fa-solid fa-clock-rotate-left', '管理聊天备份', 'chm-chat-backups-button');
+    backups.addEventListener('click', event => { event.stopPropagation(); openChatBackups(chat); });
+    actions.append(rename, backups, createChatActionsMenu(chat, { depth, descendants }));
     row.append(branchRail);
     if (chatsBatchMode) {
         const select = document.createElement('label');
@@ -1106,36 +2013,61 @@ function renderFolderSection(entry, folder, roots, query, container) {
     container.append(section);
 }
 
+async function requestCharacterDetailsManually(entry) {
+    const policy = characterDetailPolicy(entry);
+    if (!policy.automatic) {
+        const content = document.createElement('div');
+        const title = document.createElement('h3');
+        title.textContent = '加载大型聊天详情？';
+        const summary = document.createElement('p');
+        summary.textContent = `需要扫描 ${policy.files} 个聊天文件，共 ${humanFileSize(policy.bytes)}。`;
+        const warning = document.createElement('p');
+        warning.className = 'chm-popup-note';
+        warning.textContent = '这会读取所有聊天以识别分支、楼层数和末条预览，可能显著增加 Docker 容器或浏览器的内存占用。保持轻量模式最安全。';
+        content.append(title, summary, warning);
+        const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '仍要加载', cancelButton: t`Cancel` });
+        if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+    }
+    const cached = getCachedCharacter(entry.key);
+    if (!cached?.isSummary) return;
+    cached.detailRetryAfter = 0;
+    cached.detailState = 'loading';
+    scheduleCharacterDetails({
+        id: entry.id,
+        key: entry.key,
+        character: entry.character,
+    }, characterCacheEpoch, { manual: true });
+    await refreshChats();
+}
+
 function createCharacterBody(entry, query) {
     const body = document.createElement('div');
     body.className = 'chm-character-body';
     if (entry.isSummary) {
         const status = document.createElement('div');
-        status.className = `chm-detail-status${entry.detailState === 'deferred' ? ' is-deferred' : ''}`;
+        const requiresManualLoad = entry.detailState === 'manual';
+        const canRetry = requiresManualLoad || entry.detailState === 'deferred';
+        status.className = `chm-detail-status${canRetry ? ' is-deferred' : ''}`;
         const icon = document.createElement('i');
-        icon.className = entry.detailState === 'deferred'
+        icon.className = canRetry
             ? 'fa-solid fa-circle-exclamation'
             : 'fa-solid fa-circle-notch fa-spin';
         icon.setAttribute('aria-hidden', 'true');
         const text = document.createElement('span');
-        text.textContent = entry.detailState === 'deferred'
-            ? '聊天名称已加载，预览与分支详情稍后重试'
-            : '聊天名称已加载，正在后台补充分支与预览…';
+        if (requiresManualLoad) {
+            const policy = characterDetailPolicy(entry);
+            text.textContent = `轻量模式：${policy.files} 个聊天、${humanFileSize(policy.bytes)}，未自动扫描预览与分支`;
+        } else {
+            text.textContent = entry.detailState === 'deferred'
+                ? '聊天名称已加载，预览与分支详情稍后重试'
+                : '聊天名称已加载，正在后台补充分支与预览…';
+        }
         status.append(icon, text);
-        if (entry.detailState === 'deferred') {
-            const retry = iconButton('fa-solid fa-rotate', '立即重试详情加载');
+        if (canRetry) {
+            const retry = iconButton(requiresManualLoad ? 'fa-solid fa-database' : 'fa-solid fa-rotate', requiresManualLoad ? '手动加载完整详情' : '立即重试详情加载');
             retry.addEventListener('click', event => {
                 event.stopPropagation();
-                const cached = getCachedCharacter(entry.key);
-                if (!cached?.isSummary) return;
-                cached.detailRetryAfter = 0;
-                cached.detailState = 'loading';
-                scheduleCharacterDetails({
-                    id: entry.id,
-                    key: entry.key,
-                    character: entry.character,
-                });
-                void refreshChats();
+                void requestCharacterDetailsManually(entry);
             });
             status.append(retry);
         }
@@ -1290,15 +2222,17 @@ function hasPinnedChatForCharacter(characterKeyValue) {
     return settings().pinnedChats.some(key => key.startsWith(prefix));
 }
 
-async function refreshChats(force = false) {
+async function refreshChats(force = false, { background = false } = {}) {
     if (!chatsPanel) return;
     const generation = ++loadGeneration;
     const query = chatsPanel.querySelector('.chm-search-input')?.value.trim().toLocaleLowerCase() || '';
     const list = chatsPanel.querySelector('.chm-sections');
     const loading = chatsPanel.querySelector('.chm-loading');
     if (!list || !loading) return;
-    loading.hidden = false;
-    list.classList.add('is-loading');
+    if (!background) {
+        loading.hidden = false;
+        list.classList.add('is-loading');
+    }
     try {
     const descriptors = getCharacterDescriptors();
     const activeKey = getActiveCharacterKey();
@@ -1608,11 +2542,11 @@ function makeChatsPanel() {
     sections.className = 'chm-sections';
     wrapper.append(toolbar, controls, batchBar, loading, sections);
     wrapper.addEventListener('scroll', () => {
-        wrapper.querySelectorAll('details[open]').forEach(details => details.removeAttribute('open'));
+        wrapper.querySelectorAll('details.chm-row-menu[open], details.chm-toolbar-menu[open]').forEach(details => details.removeAttribute('open'));
     }, { passive: true });
     wrapper.addEventListener('click', event => {
         if (event.target.closest('details')) return;
-        wrapper.querySelectorAll('details[open]').forEach(details => details.removeAttribute('open'));
+        wrapper.querySelectorAll('details.chm-row-menu[open], details.chm-toolbar-menu[open]').forEach(details => details.removeAttribute('open'));
     });
     queueMicrotask(updateChatsBatchUi);
     return wrapper;
@@ -2113,25 +3047,39 @@ async function applyNativeChatGrouping(generation = nativeGroupingGeneration) {
 }
 
 function registerEvents() {
-    const refresh = (characterKeyValue = '') => {
-        invalidateCharacterCache(characterKeyValue);
-        if (chatsPanel && !chatsPanel.hidden) void refreshChats();
-        scheduleNativeChatGrouping();
+    let refreshTimer = null;
+    let invalidateAll = false;
+    const invalidationKeys = new Set();
+    const scheduleRefresh = ({ invalidate = false, characterKeyValue = '' } = {}) => {
+        if (invalidate) {
+            if (characterKeyValue) invalidationKeys.add(characterKeyValue);
+            else invalidateAll = true;
+        }
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+            if (invalidateAll) invalidateCharacterCache();
+            else invalidationKeys.forEach(invalidateCharacterCache);
+            invalidateAll = false;
+            invalidationKeys.clear();
+            if (chatsPanel && !chatsPanel.hidden) void refreshChats();
+            scheduleNativeChatGrouping();
+        }, 180);
     };
     if (event_types.CHAT_CHANGED) {
         SillyTavern.getContext().eventSource?.on(event_types.CHAT_CHANGED, () => {
             browseAllCharacters = false;
-            refresh(getActiveCharacterKey());
+            const activeKey = getActiveCharacterKey();
+            const cached = activeKey ? getCachedCharacter(activeKey) : null;
+            const currentExists = cached?.chats.some(chat => chat.fileName === currentChatName());
+            scheduleRefresh({ invalidate: Boolean(activeKey && !currentExists), characterKeyValue: activeKey });
             void validateBackToParentButton();
         });
     }
     for (const type of [event_types.CHARACTER_RENAMED, event_types.CHARACTER_DELETED]) {
-        if (type) SillyTavern.getContext().eventSource?.on(type, () => refresh());
+        if (type) SillyTavern.getContext().eventSource?.on(type, () => scheduleRefresh({ invalidate: true }));
     }
     if (event_types.CHARACTER_PAGE_LOADED) {
-        SillyTavern.getContext().eventSource?.on(event_types.CHARACTER_PAGE_LOADED, () => {
-            if (chatsPanel && !chatsPanel.hidden) void refreshChats();
-        });
+        SillyTavern.getContext().eventSource?.on(event_types.CHARACTER_PAGE_LOADED, () => scheduleRefresh());
     }
 }
 
