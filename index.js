@@ -25,6 +25,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     collapsedPinned: false,
     sortMode: 'recent',
     pageSize: 10,
+    chatMeta: {},
 });
 
 let panel = null;
@@ -44,6 +45,10 @@ const CHAT_DETAIL_CONCURRENCY = 1;
 const CHAT_AUTO_DETAIL_MAX_BYTES = 256 * 1024 * 1024;
 const CHAT_AUTO_DETAIL_MAX_FILES = 80;
 const CHAT_PREVIEW_CACHE_LIMIT = 512;
+const CHAT_INDEX_REQUEST_TIMEOUT_MS = 20000;
+const META_HARVEST_TIMEOUT_MS = 20000;
+const META_HARVEST_REFRESH_EVERY = 8;
+const META_HARVEST_RETRY_MS = 120000;
 const BACKUP_PAGE_SIZE = 50;
 const BACKUP_PREVIEW_HEAD_BYTES = 512 * 1024;
 const BACKUP_PREVIEW_TAIL_BYTES = 1024 * 1024;
@@ -67,6 +72,132 @@ let chatsBatchMode = false;
 let chatsBatchBusy = false;
 const chatsSelectedChats = new Map();
 const renderedChats = new Map();
+const CHAT_FUSE_MIN_MESSAGES = 5;
+const knownChatSizes = new Map();
+let chatFuseBypassUntil = 0;
+const recentRequestFailures = [];
+const DIAGNOSTIC_WINDOW_MS = 60000;
+
+function chatSizeKey(avatar, fileName) {
+    return `${String(avatar || '')}::${chatName(fileName)}`;
+}
+
+// Only ever grows unless a shrink was explicitly approved: a chat that was just destroyed
+// reports a length of 1, and recording that would disarm the fuse for the next attempt.
+function rememberChatSize(avatar, fileName, count, { allowShrink = false } = {}) {
+    const value = Number(count);
+    if (!avatar || !fileName || !Number.isFinite(value) || value < 0) return;
+    const key = chatSizeKey(avatar, fileName);
+    const previous = knownChatSizes.get(key);
+    if (!allowShrink && previous !== undefined && value < previous) return;
+    knownChatSizes.set(key, value);
+}
+
+// Affected users run large libraries on slow hosts where SillyTavern's own /api/chats/get can
+// fail; that is what destroys a chat. Capture what was in flight so a report can name the cause.
+function recordRequestFailure(url, detail) {
+    recentRequestFailures.push({ at: Date.now(), url: String(url).slice(-70), detail: String(detail).slice(0, 120) });
+    while (recentRequestFailures.length > 40) recentRequestFailures.shift();
+}
+
+function collectDiagnostics(payload, messages, known) {
+    const since = Date.now() - DIAGNOSTIC_WINDOW_MS;
+    return {
+        chat: chatName(payload.file_name),
+        avatar: payload.avatar_url,
+        knownMessages: known,
+        attemptedMessages: messages,
+        backupPageOpen: Boolean(chatsPanel?.querySelector('.chm-chat-backups-view')),
+        pendingCharacterLoads: pendingCharacterLoads.size,
+        pendingCharacterDetails: pendingCharacterDetails.size,
+        recentFailures: recentRequestFailures.filter(item => item.at >= since),
+        userAgent: navigator.userAgent,
+        at: new Date().toISOString(),
+    };
+}
+
+function blockedSaveResponse() {
+    return new Response(JSON.stringify({ error: 'chats-manager-fuse' }), {
+        status: 409,
+        statusText: 'Blocked by Chats Manager',
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
+async function confirmDestructiveSave(payload, messages, known, proceed) {
+    const name = chatName(payload.file_name);
+    const diagnostics = collectDiagnostics(payload, messages, known);
+    window.chatsManagerLastIncident = diagnostics;
+    console.error(`[Chats Manager] Blocked a chat save that would shrink "${name}" from ${known} to ${messages} message(s).`);
+    console.error('[Chats Manager] 诊断信息（请把这段发给作者）:', JSON.stringify(diagnostics, null, 2));
+    const content = document.createElement('div');
+    const title = document.createElement('h3');
+    title.textContent = '已阻止一次异常覆盖';
+    const summary = document.createElement('p');
+    summary.textContent = `聊天“${name}”原有 ${known} 条消息，本次却只保存 ${messages} 条。`;
+    const note = document.createElement('p');
+    note.className = 'chm-popup-note';
+    note.textContent = '磁盘上的聊天文件还没有被改动。酒馆载入聊天失败时会用一条开场白覆盖原文件，这通常就是那种情况。刷新页面即可重新载入完整聊天。如果这 ${messages} 条是你自己删剩的，才需要继续保存。';
+    note.textContent = note.textContent.replace('${messages}', String(messages));
+    const help = document.createElement('p');
+    help.className = 'chm-popup-note';
+    help.textContent = '诊断信息已写入浏览器控制台（F12 → Console），也可以在控制台输入 chatsManagerLastIncident 取出，发给作者可以帮助定位。';
+    content.append(title, summary, note, help);
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', {
+        okButton: '这是我删的，继续保存',
+        cancelButton: '阻止并刷新页面（推荐）',
+    });
+    if (await popup.show() === POPUP_RESULT.AFFIRMATIVE) {
+        chatFuseBypassUntil = Date.now() + 30000;
+        rememberChatSize(payload.avatar_url, payload.file_name, messages, { allowShrink: true });
+        return proceed();
+    }
+    window.location.reload();
+    return blockedSaveResponse();
+}
+
+// SillyTavern rewrites a chat file with a lone greeting whenever getChat() throws or returns
+// nothing (script.js getChatResult), and the server skips its integrity check for chats that
+// carry no integrity slug. Reproduced: a single failed /api/chats/get destroys a 185-message
+// chat, with or without this extension installed. This fuse blocks that one specific write.
+function installChatSaveFuse() {
+    if (window.__chmChatSaveFuseInstalled) return;
+    window.__chmChatSaveFuseInstalled = true;
+    const originalFetch = window.fetch;
+    window.fetch = function (...args) {
+        const [input, init] = args;
+        const url = String(typeof input === 'string' ? input : input?.url || '');
+        const body = init?.body;
+        // Bodies large enough to matter are gzipped by compressRequest and are never the
+        // greeting-only save we are guarding against, so only plain strings are inspected.
+        if (!url.includes('/api/chats/save') || typeof body !== 'string') {
+            if (/\/api\/(chats|characters\/chats|backups)/.test(url)) {
+                return originalFetch.apply(this, args).then(response => {
+                    if (!response.ok) recordRequestFailure(url, `HTTP ${response.status}`);
+                    return response;
+                }, error => {
+                    recordRequestFailure(url, error?.message || error);
+                    throw error;
+                });
+            }
+            return originalFetch.apply(this, args);
+        }
+        let payload = null;
+        try {
+            payload = JSON.parse(body);
+        } catch {
+            return originalFetch.apply(this, args);
+        }
+        const messages = Array.isArray(payload?.chat) ? payload.chat.length - 1 : NaN;
+        if (!Number.isFinite(messages) || messages > 1 || payload?.force) {
+            return originalFetch.apply(this, args);
+        }
+        if (Date.now() < chatFuseBypassUntil) return originalFetch.apply(this, args);
+        const known = knownChatSizes.get(chatSizeKey(payload.avatar_url, payload.file_name));
+        if (!(Number(known) >= CHAT_FUSE_MIN_MESSAGES)) return originalFetch.apply(this, args);
+        return confirmDestructiveSave(payload, messages, known, () => originalFetch.apply(this, args));
+    };
+}
 
 function settings() {
     extension_settings[MODULE_NAME] ??= structuredClone(DEFAULT_SETTINGS);
@@ -227,45 +358,279 @@ function compactChatPreview(value) {
     return text.length > CHAT_PREVIEW_CACHE_LIMIT ? text.slice(0, CHAT_PREVIEW_CACHE_LIMIT) : text;
 }
 
-async function fetchCharacterChats(character, id, { simple = false } = {}) {
+// Chat metadata (main_chat / integrity / chat_id_hash) lives on the first line of the chat
+// file and never changes once written, so it is harvested once per chat and kept in settings.
+// A missing entry means "not looked at yet"; an entry that exists but carries no main_chat
+// means "confirmed to have no parent". A failed read must never collapse into the latter.
+function getChatMetaStore(characterKeyValue) {
+    const all = settings().chatMeta;
+    all[characterKeyValue] ??= {};
+    return all[characterKeyValue];
+}
+
+function hasStoredChatMeta(characterKeyValue, fileName) {
+    return Object.hasOwn(getChatMetaStore(characterKeyValue), fileName);
+}
+
+function readStoredChatMeta(characterKeyValue, fileName) {
+    const stored = getChatMetaStore(characterKeyValue)[fileName];
+    if (!stored) return {};
+    return {
+        ...(stored.p ? { main_chat: stored.p } : {}),
+        ...(stored.i ? { integrity: stored.i } : {}),
+        ...(stored.h ? { chat_id_hash: stored.h } : {}),
+    };
+}
+
+function storeChatMeta(characterKeyValue, fileName, metadata) {
+    // Stored compactly: this table is written to settings.json on every save.
+    getChatMetaStore(characterKeyValue)[fileName] = {
+        ...(metadata.main_chat ? { p: String(metadata.main_chat) } : {}),
+        ...(metadata.integrity ? { i: String(metadata.integrity) } : {}),
+        ...(metadata.chat_id_hash ? { h: String(metadata.chat_id_hash) } : {}),
+    };
+}
+
+function renameStoredChatMeta(characterKeyValue, oldName, newName) {
+    const store = getChatMetaStore(characterKeyValue);
+    if (!Object.hasOwn(store, oldName)) return;
+    store[newName] = store[oldName];
+    delete store[oldName];
+}
+
+function pruneStoredChatMeta(characterKeyValue, existingNames) {
+    const store = getChatMetaStore(characterKeyValue);
+    const alive = new Set(existingNames);
+    let removed = 0;
+    for (const name of Object.keys(store)) {
+        if (!alive.has(name)) {
+            delete store[name];
+            removed++;
+        }
+    }
+    return removed;
+}
+
+function makeChatEntry(character, id, { fileName, message = '', itemCount = 0, lastMessage = 0 }) {
+    const key = characterKey(character);
+    return {
+        id,
+        character,
+        characterKey: key,
+        fileName,
+        message: compactChatPreview(message),
+        itemCount: Number(itemCount) || 0,
+        lastMessage: lastMessage || 0,
+        metadata: readStoredChatMeta(key, fileName),
+    };
+}
+
+// Sent over XMLHttpRequest on purpose. Other extensions patch window.fetch and reroute
+// /api/chats/search to their own fast list -- SillyTavern-Mobile-Resize-Guard answers it with
+// `file_size: '...'`, `message_count: '...'` and an empty preview, which is right for its own
+// lazily hydrated list but would leave this one with no message counts at all. XHR is not
+// affected by fetch patches, so the index always reflects what the server actually returned.
+function postJsonRaw(url, body, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', url, true);
+        request.timeout = timeoutMs;
+        for (const [name, value] of Object.entries(getRequestHeaders() || {})) {
+            try {
+                request.setRequestHeader(name, value);
+            } catch {
+                // Forbidden header names are set by the browser anyway.
+            }
+        }
+        request.onload = () => {
+            if (request.status < 200 || request.status >= 300) {
+                reject(new Error(`HTTP ${request.status}`));
+                return;
+            }
+            try {
+                resolve(JSON.parse(request.responseText));
+            } catch (error) {
+                reject(error);
+            }
+        };
+        request.onerror = () => reject(new Error('network error'));
+        request.ontimeout = () => reject(new Error(`timed out after ${timeoutMs}ms`));
+        request.send(JSON.stringify(body));
+    });
+}
+
+async function fetchChatNames(character, id) {
     const controller = new AbortController();
-    const timeoutMs = simple ? CHAT_SUMMARY_TIMEOUT_MS : CHAT_DETAIL_TIMEOUT_MS;
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), CHAT_SUMMARY_TIMEOUT_MS);
     try {
         const response = await fetch('/api/characters/chats', {
             method: 'POST',
             headers: getRequestHeaders(),
-            body: JSON.stringify({
-                avatar_url: character.avatar,
-                simple,
-                metadata: !simple,
-            }),
+            body: JSON.stringify({ avatar_url: character.avatar, simple: true }),
             signal: controller.signal,
         });
         if (!response.ok) return null;
         const data = await response.json();
         if (!Array.isArray(data) && (typeof data !== 'object' || data.error)) return null;
-        return Object.values(data).filter(item => item?.file_name).map(item => ({
-            id,
-            character,
-            characterKey: characterKey(character),
-            fileName: chatName(item.file_name),
-            message: compactChatPreview(item.mes),
-            itemCount: Number(item.chat_items) || 0,
-            lastMessage: item.last_mes || 0,
-            metadata: {
-                ...(item.chat_metadata?.main_chat ? { main_chat: item.chat_metadata.main_chat } : {}),
-                ...(item.chat_metadata?.integrity ? { integrity: item.chat_metadata.integrity } : {}),
-                ...(item.chat_metadata?.chat_id_hash ? { chat_id_hash: item.chat_metadata.chat_id_hash } : {}),
-            },
-        }));
+        return Object.values(data)
+            .filter(item => item?.file_name)
+            .map(item => makeChatEntry(character, id, { fileName: chatName(item.file_name) }));
     } catch (error) {
-        const reason = error?.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : error;
-        console.warn(`[Chats Manager] Failed to load ${simple ? 'chat names' : 'chat details'} for`, getCharacterName(character), reason);
+        const reason = error?.name === 'AbortError' ? `timed out after ${CHAT_SUMMARY_TIMEOUT_MS}ms` : error;
+        console.warn('[Chats Manager] Failed to load chat names for', getCharacterName(character), reason);
         return null;
     } finally {
         clearTimeout(timeout);
     }
+}
+
+// `/api/characters/chats` with metadata:true makes SillyTavern open a read stream for every
+// chat file of the character at once (endpoints/characters.js, jsonFiles.map). On a
+// branch-heavy character that spikes server memory hard enough that SillyTavern's own
+// /api/chats/get can fail -- and a failed load is what destroys a chat. Measured on 200
+// branches / 180 MB: that endpoint costs 516 ms and +151 MB RSS, while /api/chats/search
+// costs 21 ms and +2 MB because it walks the files one at a time.
+async function fetchChatIndex(character, id) {
+    try {
+        const data = await postJsonRaw('/api/chats/search', {
+            query: '',
+            avatar_url: character.avatar,
+            group_id: null,
+        }, CHAT_INDEX_REQUEST_TIMEOUT_MS);
+        if (!Array.isArray(data)) return null;
+        const mapped = data.filter(item => item?.file_name).map(item => makeChatEntry(character, id, {
+            fileName: chatName(item.file_name),
+            message: item.preview_message,
+            itemCount: item.message_count,
+            lastMessage: item.last_mes,
+        }));
+        if (pruneStoredChatMeta(characterKey(character), mapped.map(item => item.fileName))) saveSettings();
+        for (const item of mapped) rememberChatSize(character.avatar, item.fileName, item.itemCount);
+        return mapped;
+    } catch (error) {
+        console.warn('[Chats Manager] Failed to load chat index for', getCharacterName(character), error);
+        return null;
+    }
+}
+
+// Reads one chat through /api/chats/export, which is a plain read: unlike /api/chats/get it
+// neither parses every line nor creates the character's chat directory when it is missing.
+// Only the first line is kept; the rest of the file is dropped immediately.
+// Returns null when the read was inconclusive, {} when the chat provably carries no metadata.
+async function harvestChatMeta(character, fileName) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), META_HARVEST_TIMEOUT_MS);
+    try {
+        const file = `${fileName}.jsonl`;
+        const response = await fetch('/api/chats/export', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ is_group: false, avatar_url: character.avatar, file, exportfilename: file, format: 'jsonl' }),
+            signal: controller.signal,
+        });
+        if (!response.ok) return null;
+        const data = await response.json().catch(() => null);
+        const raw = typeof data?.result === 'string' ? data.result : '';
+        if (!raw) return null;
+        const breakAt = raw.indexOf('\n');
+        let header;
+        try {
+            header = JSON.parse(breakAt === -1 ? raw : raw.slice(0, breakAt));
+        } catch {
+            return null;
+        }
+        const metadata = header?.chat_metadata;
+        if (!metadata || typeof metadata !== 'object') return {};
+        return {
+            ...(metadata.main_chat ? { main_chat: String(metadata.main_chat) } : {}),
+            ...(metadata.integrity ? { integrity: String(metadata.integrity) } : {}),
+            ...(metadata.chat_id_hash ? { chat_id_hash: String(metadata.chat_id_hash) } : {}),
+        };
+    } catch (error) {
+        if (error?.name !== 'AbortError') {
+            console.warn('[Chats Manager] Could not read chat metadata for', fileName, error);
+        }
+        return null;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+const metaHarvestQueue = [];
+const metaHarvestQueued = new Set();
+const metaHarvestRetryAfter = new Map();
+let metaHarvestRunning = false;
+let lastHarvestRender = 0;
+
+// A throttle, not a debounce: harvesting ticks faster than queueCharacterDetailsRefresh's
+// 150 ms debounce window, so that debounce would keep resetting itself and the progress
+// counter would sit frozen until the whole run finished.
+function renderHarvestProgress(force = false) {
+    const now = Date.now();
+    if (!force && now - lastHarvestRender < 700) return;
+    lastHarvestRender = now;
+    if (chatsPanel && !chatsPanel.hidden) void refreshChats(false, { background: true });
+}
+
+function queueMetaHarvest(character, id, chats) {
+    const key = characterKey(character);
+    let added = 0;
+    for (const chat of chats) {
+        if (hasStoredChatMeta(key, chat.fileName)) continue;
+        const queueKey = `${key}::${chat.fileName}`;
+        if (metaHarvestQueued.has(queueKey)) continue;
+        if (Number(metaHarvestRetryAfter.get(queueKey)) > Date.now()) continue;
+        metaHarvestQueued.add(queueKey);
+        metaHarvestQueue.push({ key, character, id, fileName: chat.fileName, queueKey });
+        added++;
+    }
+    if (added) void runMetaHarvest();
+    return added;
+}
+
+// Strictly one file at a time: serialising these reads is the whole point, since the
+// concurrent variant is what put the server under enough pressure to lose chats.
+async function runMetaHarvest() {
+    if (metaHarvestRunning) return;
+    metaHarvestRunning = true;
+    let sinceRefresh = 0;
+    let dirty = false;
+    try {
+        while (metaHarvestQueue.length) {
+            const job = metaHarvestQueue.shift();
+            metaHarvestQueued.delete(job.queueKey);
+            const metadata = await harvestChatMeta(job.character, job.fileName);
+            if (metadata) {
+                storeChatMeta(job.key, job.fileName, metadata);
+                metaHarvestRetryAfter.delete(job.queueKey);
+                dirty = true;
+                const cached = getCachedCharacter(job.key);
+                const target = cached?.chats?.find(item => item.fileName === job.fileName);
+                if (target) target.metadata = readStoredChatMeta(job.key, job.fileName);
+            } else {
+                // Inconclusive read: leave it unknown and try again later rather than
+                // recording it as "has no parent", which would silently break the tree.
+                metaHarvestRetryAfter.set(job.queueKey, Date.now() + META_HARVEST_RETRY_MS);
+            }
+            if (++sinceRefresh >= META_HARVEST_REFRESH_EVERY) {
+                sinceRefresh = 0;
+                if (dirty) {
+                    saveSettings();
+                    dirty = false;
+                }
+                renderHarvestProgress();
+            }
+        }
+    } finally {
+        metaHarvestRunning = false;
+        if (dirty) saveSettings();
+        renderHarvestProgress(true);
+        scheduleNativeChatGrouping();
+    }
+}
+
+async function fetchCharacterChats(character, id, { simple = false } = {}) {
+    return simple ? fetchChatNames(character, id) : fetchChatIndex(character, id);
 }
 
 function getCharacterDescriptors() {
@@ -326,10 +691,6 @@ function characterDetailPolicy(entry) {
 function scheduleCharacterDetails(descriptor, requestEpoch = characterCacheEpoch, { manual = false } = {}) {
     const cached = getCachedCharacter(descriptor.key);
     if (!cached?.isSummary || pendingCharacterDetails.has(descriptor.key)) return;
-    if (!manual && !characterDetailPolicy(cached).automatic) {
-        cached.detailState = 'manual';
-        return;
-    }
     if (Number(cached.detailRetryAfter) > Date.now()) return;
     cached.detailState = 'loading';
     const request = (async () => {
@@ -347,6 +708,14 @@ function scheduleCharacterDetails(descriptor, requestEpoch = characterCacheEpoch
                     isSummary: false,
                     detailState: 'ready',
                 });
+                // The index itself is cheap now, so it always runs. Only reading every chat
+                // file to learn the branch structure stays behind the large-library gate.
+                const harvestAllowed = manual || characterDetailPolicy({ ...descriptor, chats }).automatic;
+                if (harvestAllowed) queueMetaHarvest(descriptor.character, descriptor.id, chats);
+                else {
+                    const current = getCachedCharacter(descriptor.key);
+                    if (current) current.treeState = 'manual';
+                }
             } else {
                 characterChatCache.set(descriptor.key, {
                     ...current,
@@ -545,17 +914,68 @@ function subtreeCount(node) {
     return node.children.reduce((total, child) => total + 1 + subtreeCount(child), 0);
 }
 
+// SillyTavern rewrites the target chat file with a fresh greeting whenever getChat() ends up
+// with an empty chat array, and the server-side integrity check is skipped for chats that have
+// no integrity slug yet. So a stale file name or a character switch that silently did not happen
+// is enough to destroy an existing chat. Everything below refuses to open rather than risk that.
+async function chatFileExists(character, fileName) {
+    try {
+        const response = await fetch('/api/characters/chats', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ avatar_url: character.avatar, simple: true }),
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        if (!Array.isArray(data)) return null;
+        return data.some(item => chatName(item?.file_name) === fileName);
+    } catch (error) {
+        console.warn('[Chats Manager] Could not verify chat file before opening', fileName, error);
+        return null;
+    }
+}
+
+async function ensureCharacterSelected(id) {
+    if (String(SillyTavern.getContext().characterId) === String(id)) return true;
+    await selectCharacterById(id);
+    // selectCharacterById returns silently when the chat is still saving or a reply is being
+    // generated. Acting now would point the *previous* character at this chat file name.
+    if (String(SillyTavern.getContext().characterId) === String(id)) return true;
+    toastr.warning('酒馆正忙（正在保存或生成回复），没有切换角色。请稍后再试。');
+    return false;
+}
+
+let openChatInFlight = false;
+
 async function openChat(chat) {
+    if (openChatInFlight) return;
+    openChatInFlight = true;
+    try {
+        await openChatUnsafe(chat);
+    } finally {
+        openChatInFlight = false;
+    }
+}
+
+async function openChatUnsafe(chat) {
     const liveContext = SillyTavern.getContext();
     const liveEntry = Object.entries(liveContext.characters || []).find(([, character]) => characterKey(character) === chat.characterKey);
     if (!liveEntry) {
         toastr.error('找不到这个角色，角色可能已被删除。');
         return;
     }
-    const [id] = liveEntry;
-    if (String(liveContext.characterId) !== String(id)) {
-        await selectCharacterById(id);
-        await new Promise(resolve => setTimeout(resolve, 120));
+    const [id, liveCharacter] = liveEntry;
+    if (!await ensureCharacterSelected(id)) return;
+    const exists = await chatFileExists(liveCharacter, chat.fileName);
+    if (exists === false) {
+        toastr.error(`聊天“${chat.fileName}”已经不存在了，可能在别处被重命名或删除。已刷新列表。`);
+        invalidateCharacterCache(chat.characterKey);
+        await refreshChats(true);
+        return;
+    }
+    if (exists === null) {
+        toastr.error('无法确认这个聊天是否还存在，已取消打开以避免覆盖聊天记录。请检查酒馆连接后重试。');
+        return;
     }
     await openCharacterChat(chat.fileName);
     chatsPanel?.querySelectorAll('.chm-chat-row.is-current').forEach(row => row.classList.remove('is-current'));
@@ -588,6 +1008,9 @@ async function renameChat(chat) {
         if (alias === chat.fileName) library.chatAliases[oldName] = nextName;
     }
     library.chatAliases[chat.fileName] = nextName;
+    renameStoredChatMeta(chat.characterKey, chat.fileName, nextName);
+    const knownSize = knownChatSizes.get(chatSizeKey(chat.character?.avatar, chat.fileName));
+    if (knownSize !== undefined) rememberChatSize(chat.character?.avatar, nextName, knownSize, { allowShrink: true });
     const oldPinKey = chatPinKey(chat);
     const pinIndex = settings().pinnedChats.indexOf(oldPinKey);
     if (pinIndex >= 0) settings().pinnedChats[pinIndex] = `${chat.characterKey}::${nextName}`;
@@ -1383,6 +1806,24 @@ async function readBackupIdentity(backup, signal) {
     } finally {
         await reader.cancel().catch(() => {});
     }
+    // The header is the first line. Parsing it beats scanning with a regex, which drops any
+    // value containing a quote or a backslash.
+    const breakAt = text.indexOf('\n');
+    let metadata = null;
+    try {
+        metadata = JSON.parse(breakAt === -1 ? text : text.slice(0, breakAt))?.chat_metadata ?? null;
+    } catch {
+        metadata = null;
+    }
+    if (metadata && typeof metadata === 'object') {
+        const integrity = metadata.integrity ? String(metadata.integrity) : '';
+        const chatHash = metadata.chat_id_hash ? String(metadata.chat_id_hash) : '';
+        return {
+            identity: integrity || chatHash,
+            chatHash,
+        };
+    }
+    // Header did not fit in the sampled bytes or is malformed; fall back to the loose scan.
     const integrity = text.match(/"integrity"\s*:\s*"([^"\\]+)"/)?.[1];
     const hashMatch = text.match(/"chat_id_hash"\s*:\s*(?:"([^"\\]+)"|(\d+))/);
     const chatHash = hashMatch?.[1] || hashMatch?.[2] || '';
@@ -1466,7 +1907,7 @@ function makeBackupsPanel(targetChat) {
         <div class="chm-backups-sticky">
             <div class="chm-toolbar chm-backups-toolbar">
                 <button type="button" class="chm-icon-button chm-backups-back" title="返回聊天列表" aria-label="返回聊天列表"><i class="fa-solid fa-arrow-left"></i></button>
-                <div class="chm-backups-title"><strong></strong><span class="chm-backups-count">历史备份</span></div>
+                <div class="chm-backups-title"><strong></strong><span class="chm-backups-count">历史备份</span><span class="chm-backups-note" hidden></span></div>
                 <button type="button" class="chm-icon-button chm-backups-batch-toggle" title="批量管理这条聊天的备份" aria-label="批量管理这条聊天的备份"><i class="fa-solid fa-pen-to-square"></i></button>
                 <button type="button" class="chm-icon-button chm-backups-refresh" title="刷新这条聊天的备份" aria-label="刷新这条聊天的备份"><i class="fa-solid fa-rotate"></i></button>
             </div>
@@ -1487,6 +1928,7 @@ function makeBackupsPanel(targetChat) {
     wrapper.querySelector('.chm-backups-title strong').textContent = targetChat.fileName;
     const search = wrapper.querySelector('.chm-backups-search');
     const count = wrapper.querySelector('.chm-backups-count');
+    const note = wrapper.querySelector('.chm-backups-note');
     const batchbar = wrapper.querySelector('.chm-backups-batchbar');
     const selectedLabel = wrapper.querySelector('.chm-backups-selected');
     const downloadSelected = wrapper.querySelector('.chm-backups-download-selected');
@@ -1498,6 +1940,7 @@ function makeBackupsPanel(targetChat) {
     let page = 1;
     let pageSize = BACKUP_HISTORY_DEFAULT_PAGE_SIZE;
     let batchMode = false;
+    let ambiguousSiblings = 0;
     let loaded = false;
     let loading = false;
     let loadController = null;
@@ -1600,6 +2043,12 @@ function makeBackupsPanel(targetChat) {
         count.textContent = loading
             ? '正在识别聊天备份…'
             : search.value.trim() ? `${filtered.length} / ${allBackups().length} 份备份` : `${filtered.length} 份备份`;
+        const showNote = !loading && loaded && ambiguousSiblings > 1 && allBackups().length > 0;
+        note.hidden = !showNote;
+        if (showNote) {
+            note.textContent = `与 ${ambiguousSiblings - 1} 个分支共用备份，酒馆未记录每份属于哪一个`;
+            note.title = '酒馆的备份文件按角色命名，而分支会继承父聊天的标识，所以一个分支家族共用同一批备份。请用下面的时间、楼层数和末条预览来判断要恢复哪一份。恢复始终导入为新聊天，不会覆盖现有聊天。';
+        }
         pagination.replaceChildren();
         const status = document.createElement('span');
         status.className = 'chm-page-status';
@@ -1640,17 +2089,16 @@ function makeBackupsPanel(targetChat) {
         selected.clear();
         render();
         try {
-            const response = await fetch('/api/backups/chat/get', {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                signal: loadController.signal,
-            });
-            if (!response.ok) throw new Error('无法读取聊天备份列表');
+            // XHR, not fetch: extensions patch window.fetch and answer this endpoint from their
+            // own fast list, which drops the fields this page shows. SillyTavern-Mobile-Resize-Guard
+            // intercepts every POST to it, so each row would read "没有末条消息预览".
+            const backupList = await postJsonRaw('/api/backups/chat/get', {}, CHAT_INDEX_REQUEST_TIMEOUT_MS);
+            if (loadController.signal.aborted) return;
+            if (!Array.isArray(backupList)) throw new Error('无法读取聊天备份列表');
             const source = String(targetChat.character?.avatar || '')
                 .replace(/\.[^.]+$/i, '')
                 .replace(/[^a-z0-9]/gi, '_')
                 .toLowerCase();
-            const backupList = await response.json();
             const backups = backupList.filter(backup => parseBackupName(backup.file_name).source.toLowerCase() === source);
             await identifyBackups(backups, loadController.signal, (done, total) => {
                 count.textContent = `正在识别聊天… ${done}/${total}`;
@@ -1667,6 +2115,17 @@ function makeBackupsPanel(targetChat) {
             groups = groupBackupsByChat(backups).filter(group => (
                 integrity ? group.identity === integrity : candidateHashes.has(String(group.chatHash))
             ));
+            // SillyTavern names backups after the character, not the chat, and a branch family
+            // shares both the integrity slug and main_chat. Siblings therefore cannot be told
+            // apart from the backup alone; say so instead of implying a precise match.
+            // A branch inherits its parent's integrity slug, and SillyTavern names backups after
+            // the character rather than the chat, so every chat in a branch family shares one
+            // backup set. Say how many chats that is instead of implying a per-chat match.
+            const entry = getCachedCharacter(targetChat.characterKey);
+            const familySize = integrity
+                ? (entry?.chats || []).filter(item => String(item.metadata?.integrity || '') === integrity).length
+                : 1;
+            ambiguousSiblings = familySize > 1 ? familySize : 0;
             loaded = true;
             page = 1;
         } catch (error) {
@@ -1723,7 +2182,7 @@ function makeBackupsPanel(targetChat) {
 async function startNewChatForCharacter() {
     const target = await chooseTargetCharacter('选择要新建聊天的角色');
     if (!target) return;
-    await selectCharacterById(target.id);
+    if (!await ensureCharacterSelected(target.id)) return;
     await doNewChat({ deleteCurrentChat: false });
     browseAllCharacters = false;
     invalidateCharacterCache(target.key);
@@ -1733,7 +2192,7 @@ async function startNewChatForCharacter() {
 async function openNativeManagerForCharacter() {
     const target = await chooseTargetCharacter('选择要管理聊天的角色');
     if (!target) return;
-    await selectCharacterById(target.id);
+    if (!await ensureCharacterSelected(target.id)) return;
     document.getElementById('option_select_chat')?.click();
 }
 
@@ -1824,6 +2283,14 @@ function positionFloatingMenu(details, popover = details.querySelector('.chm-row
 
 function setupFloatingMenu(details, popover) {
     popover._chmOwnerDetails = details;
+    // While open, the popover is portaled to <body> so it can escape the panel's clipping.
+    // SillyTavern closes unpinned drawers from `$('html').on('touchstart mousedown')` whenever
+    // the target sits outside an open drawer (script.js), and a portaled menu counts as
+    // outside -- which collapsed the whole character panel behind the menu. Stopping these
+    // two events at the popover keeps the panel open; the click handlers still run normally.
+    for (const type of ['mousedown', 'touchstart']) {
+        popover.addEventListener(type, event => event.stopPropagation());
+    }
     details.addEventListener('toggle', () => {
         if (!details.open) {
             popover.classList.remove('is-portaled', 'is-positioning');
@@ -2013,65 +2480,76 @@ function renderFolderSection(entry, folder, roots, query, container) {
     container.append(section);
 }
 
-async function requestCharacterDetailsManually(entry) {
-    const policy = characterDetailPolicy(entry);
-    if (!policy.automatic) {
-        const content = document.createElement('div');
-        const title = document.createElement('h3');
-        title.textContent = '加载大型聊天详情？';
-        const summary = document.createElement('p');
-        summary.textContent = `需要扫描 ${policy.files} 个聊天文件，共 ${humanFileSize(policy.bytes)}。`;
-        const warning = document.createElement('p');
-        warning.className = 'chm-popup-note';
-        warning.textContent = '这会读取所有聊天以识别分支、楼层数和末条预览，可能显著增加 Docker 容器或浏览器的内存占用。保持轻量模式最安全。';
-        content.append(title, summary, warning);
-        const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '仍要加载', cancelButton: t`Cancel` });
-        if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
-    }
+async function retryChatIndex(entry) {
     const cached = getCachedCharacter(entry.key);
     if (!cached?.isSummary) return;
     cached.detailRetryAfter = 0;
     cached.detailState = 'loading';
-    scheduleCharacterDetails({
-        id: entry.id,
-        key: entry.key,
-        character: entry.character,
-    }, characterCacheEpoch, { manual: true });
+    scheduleCharacterDetails({ id: entry.id, key: entry.key, character: entry.character }, characterCacheEpoch, { manual: true });
+    await refreshChats();
+}
+
+async function requestBranchHarvest(entry, pending) {
+    const policy = characterDetailPolicy(entry);
+    const content = document.createElement('div');
+    const title = document.createElement('h3');
+    title.textContent = '读取分支关系？';
+    const summary = document.createElement('p');
+    summary.textContent = `需要逐个读取 ${pending} 个聊天文件，该角色共 ${humanFileSize(policy.bytes)}。`;
+    const note = document.createElement('p');
+    note.className = 'chm-popup-note';
+    note.textContent = '分支关系写在每个聊天文件的第一行，只能整份读回来再取。读取一次一个文件，不会给酒馆造成内存压力，但会花一些时间和流量。结果会被记住，之后只有新建的分支需要再读。';
+    content.append(title, summary, note);
+    const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '开始读取', cancelButton: t`Cancel` });
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+    const cached = getCachedCharacter(entry.key);
+    if (cached) delete cached.treeState;
+    queueMetaHarvest(entry.character, entry.id, entry.chats);
     await refreshChats();
 }
 
 function createCharacterBody(entry, query) {
     const body = document.createElement('div');
     body.className = 'chm-character-body';
-    if (entry.isSummary) {
+    const makeStatus = (iconClass, message, button = null) => {
         const status = document.createElement('div');
-        const requiresManualLoad = entry.detailState === 'manual';
-        const canRetry = requiresManualLoad || entry.detailState === 'deferred';
-        status.className = `chm-detail-status${canRetry ? ' is-deferred' : ''}`;
+        status.className = `chm-detail-status${button ? ' is-deferred' : ''}`;
         const icon = document.createElement('i');
-        icon.className = canRetry
-            ? 'fa-solid fa-circle-exclamation'
-            : 'fa-solid fa-circle-notch fa-spin';
+        icon.className = iconClass;
         icon.setAttribute('aria-hidden', 'true');
         const text = document.createElement('span');
-        if (requiresManualLoad) {
-            const policy = characterDetailPolicy(entry);
-            text.textContent = `轻量模式：${policy.files} 个聊天、${humanFileSize(policy.bytes)}，未自动扫描预览与分支`;
-        } else {
-            text.textContent = entry.detailState === 'deferred'
-                ? '聊天名称已加载，预览与分支详情稍后重试'
-                : '聊天名称已加载，正在后台补充分支与预览…';
-        }
+        text.textContent = message;
         status.append(icon, text);
-        if (canRetry) {
-            const retry = iconButton(requiresManualLoad ? 'fa-solid fa-database' : 'fa-solid fa-rotate', requiresManualLoad ? '手动加载完整详情' : '立即重试详情加载');
+        if (button) status.append(button);
+        body.append(status);
+    };
+    if (entry.isSummary) {
+        const deferred = entry.detailState === 'deferred';
+        let retry = null;
+        if (deferred) {
+            retry = iconButton('fa-solid fa-rotate', '立即重试');
             retry.addEventListener('click', event => {
                 event.stopPropagation();
-                void requestCharacterDetailsManually(entry);
+                void retryChatIndex(entry);
             });
-            status.append(retry);
         }
-        body.append(status);
+        makeStatus(
+            deferred ? 'fa-solid fa-circle-exclamation' : 'fa-solid fa-circle-notch fa-spin',
+            deferred ? '聊天名称已加载，楼层与预览稍后重试' : '聊天名称已加载，正在读取楼层与预览…',
+            retry,
+        );
+    } else {
+        const pending = entry.chats.filter(item => !hasStoredChatMeta(entry.key, item.fileName)).length;
+        if (pending && entry.treeState === 'manual') {
+            const load = iconButton('fa-solid fa-code-branch', '读取分支关系');
+            load.addEventListener('click', event => {
+                event.stopPropagation();
+                void requestBranchHarvest(entry, pending);
+            });
+            makeStatus('fa-solid fa-circle-exclamation', `分支关系未读取：还有 ${pending} 个聊天待确认`, load);
+        } else if (pending) {
+            makeStatus('fa-solid fa-circle-notch fa-spin', `正在读取分支关系…还剩 ${pending} 个`);
+        }
     }
     const roots = buildChatTree(entry.chats).filter(root => treeMatches(root, query));
     const library = getLibrary(entry.key);
@@ -3067,6 +3545,11 @@ function registerEvents() {
     };
     if (event_types.CHAT_CHANGED) {
         SillyTavern.getContext().eventSource?.on(event_types.CHAT_CHANGED, () => {
+            const liveContext = SillyTavern.getContext();
+            const liveCharacter = liveContext.characters?.[liveContext.characterId];
+            if (liveCharacter && !liveContext.groupId) {
+                rememberChatSize(liveCharacter.avatar, currentChatName(), liveContext.chat?.length);
+            }
             browseAllCharacters = false;
             const activeKey = getActiveCharacterKey();
             const cached = activeKey ? getCachedCharacter(activeKey) : null;
@@ -3084,6 +3567,7 @@ function registerEvents() {
 }
 
 function init() {
+    installChatSaveFuse();
     settings();
     if (!installTabs()) {
         setTimeout(installTabs, 500);

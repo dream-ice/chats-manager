@@ -80,6 +80,16 @@
 .chm-backups-title { display: flex; min-width: 0; flex: 1 1 auto; flex-direction: column; gap: 1px; }
 .chm-backups-title strong { overflow: hidden; font-size: .92em; text-overflow: ellipsis; white-space: nowrap; }
 .chm-backups-title span { font-size: .72em; opacity: .58; }
+.chm-backups-note {
+    /* The panel is narrow; this warning matters more than staying on one line. */
+    margin-top: 2px;
+    color: var(--warning, #d9a441);
+    line-height: 1.3;
+    white-space: normal;
+    opacity: .8 !important;
+}
+/* Themes routinely re-declare `display` on spans, which beats the hidden attribute. */
+.chm-backups-note[hidden] { display: none !important; }
 
 .chm-backups-tools {
     display: flex;
@@ -1122,7 +1132,9 @@ details:not([open]) > .chm-row-menu-popover { display: none; }
 
 .chm-backup-preview {
     display: flex;
-    width: min(760px, 82vw);
+    /* The popup is opened wide, which forces min-width: var(--sheldWidth) on the dialog.
+       A fixed content width would leave the rest of that dialog empty on wide screens. */
+    width: 100%;
     max-height: min(72vh, 760px);
     flex-direction: column;
     gap: 10px;
