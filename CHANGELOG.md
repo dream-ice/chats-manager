@@ -55,3 +55,10 @@
 - 增加按需加载、请求并发限制与会话缓存。
 - 修复 iOS 聊天列表无法滚动及移动端工具栏布局。
 - 隐藏父聊天文件不存在时的无效返回按钮。
+# Changelog
+
+## 0.11.0
+
+- 适配 TauriTavern：按宿主环境选择请求方式，兼容其不支持 XMLHttpRequest 的接口环境，并在启动标识延迟时自动回退。
+- 兼容 TauriTavern 备份列表的 `preview_message` 和 `message_count` 字段，确保预览、搜索与消息数显示正常。
+- 在 TauriTavern 中串行读取备份标识，减少不支持 Range 时并发传输整份备份造成的压力。

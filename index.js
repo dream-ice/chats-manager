@@ -425,12 +425,39 @@ function makeChatEntry(character, id, { fileName, message = '', itemCount = 0, l
     };
 }
 
-// Sent over XMLHttpRequest on purpose. Other extensions patch window.fetch and reroute
-// /api/chats/search to their own fast list -- SillyTavern-Mobile-Resize-Guard answers it with
-// `file_size: '...'`, `message_count: '...'` and an empty preview, which is right for its own
-// lazily hydrated list but would leave this one with no message counts at all. XHR is not
-// affected by fetch patches, so the index always reflects what the server actually returned.
-function postJsonRaw(url, body, timeoutMs) {
+// Two hosts route /api/* in opposite ways, so the transport has to be picked per host.
+// TauriTavern serves it by patching window.fetch (src/tauri/main/interceptors.js) and never
+// touches XMLHttpRequest, so an XHR there reaches nothing at all. On SillyTavern /api/* is a
+// real HTTP route, but other extensions patch window.fetch to answer some of those routes from
+// their own trimmed-down caches -- SillyTavern-Mobile-Resize-Guard replies to /api/chats/search
+// with `message_count: '...'` and to /api/backups/chat/get without the last message -- so there
+// XHR is the only way to see what the server actually returned.
+let forceFetchTransport = false;
+
+function isTauriTavern() {
+    return Boolean(globalThis.__TAURITAVERN__);
+}
+
+function postJsonViaFetch(url, body, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    return (async () => {
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        } finally {
+            clearTimeout(timeout);
+        }
+    })();
+}
+
+function postJsonViaXhr(url, body, timeoutMs) {
     return new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();
         request.open('POST', url, true);
@@ -457,6 +484,23 @@ function postJsonRaw(url, body, timeoutMs) {
         request.ontimeout = () => reject(new Error(`timed out after ${timeoutMs}ms`));
         request.send(JSON.stringify(body));
     });
+}
+
+async function postJson(url, body, timeoutMs) {
+    // The host flag is read on every call, never latched at load time: TauriTavern publishes
+    // window.__TAURITAVERN__ during its own bootstrap, which may land after this module runs.
+    if (forceFetchTransport || isTauriTavern()) return postJsonViaFetch(url, body, timeoutMs);
+    try {
+        return await postJsonViaXhr(url, body, timeoutMs);
+    } catch (error) {
+        // Only a host that routes /api/* somewhere XMLHttpRequest cannot see justifies switching;
+        // a genuine server error must stay an error instead of being retried on the other path.
+        const message = String(error?.message || '');
+        if (message !== 'network error' && message !== 'HTTP 404') throw error;
+        console.warn('[Chats Manager] /api is not reachable over XMLHttpRequest here; using fetch.', url, error);
+        forceFetchTransport = true;
+        return postJsonViaFetch(url, body, timeoutMs);
+    }
 }
 
 async function fetchChatNames(character, id) {
@@ -492,7 +536,7 @@ async function fetchChatNames(character, id) {
 // costs 21 ms and +2 MB because it walks the files one at a time.
 async function fetchChatIndex(character, id) {
     try {
-        const data = await postJsonRaw('/api/chats/search', {
+        const data = await postJson('/api/chats/search', {
             query: '',
             avatar_url: character.avatar,
             group_id: null,
@@ -1271,6 +1315,17 @@ async function importChatsToCharacter() {
     input.click();
 }
 
+// SillyTavern puts the last message of a backup in `mes`; TauriTavern's backup route only
+// sends `preview_message` (its /api/characters/chats sends both, the backup one does not).
+function backupLastMessage(backup) {
+    return backup?.mes ?? backup?.preview_message ?? '';
+}
+
+function backupMessageCount(backup) {
+    const count = backup?.chat_items ?? backup?.message_count;
+    return Number.isFinite(Number(count)) ? Number(count) : null;
+}
+
 function parseBackupName(name) {
     const match = String(name).match(/^chat_(.+)_(\d{8})-(\d{6})\.jsonl$/i);
     if (!match) return { source: '其他备份', timestamp: 0 };
@@ -1409,7 +1464,7 @@ async function viewBackup(backupOrName) {
         const title = document.createElement('strong');
         title.textContent = '备份内容预览';
         const note = document.createElement('span');
-        note.textContent = `${formatDate(backup.last_mes || parseBackupName(name).timestamp)} · ${backup.chat_items ?? '?'} 条消息`;
+        note.textContent = `${formatDate(backup.last_mes || parseBackupName(name).timestamp)} · ${backupMessageCount(backup) ?? '?'} 条消息`;
         identity.append(title, note);
         const controls = document.createElement('div');
         controls.className = 'chm-backup-preview-controls';
@@ -1850,7 +1905,11 @@ async function identifyBackups(backups, signal, onProgress) {
             onProgress?.(completed, backups.length);
         }
     };
-    await Promise.all(Array.from({ length: Math.min(4, backups.length) }, worker));
+    // Reading an identity costs a ranged request of 32 KiB where Range is honoured. TauriTavern
+    // answers /api/backups/chat/download from a plain in-memory buffer and ignores Range, so each
+    // call ships the whole backup across the IPC bridge -- do those one at a time.
+    const concurrency = Math.min(isTauriTavern() ? 1 : 4, backups.length);
+    await Promise.all(Array.from({ length: concurrency }, worker));
     return backups;
 }
 
@@ -1953,7 +2012,7 @@ function makeBackupsPanel(targetChat) {
         if (!query) return allBackups();
         return allBackups().filter(backup => {
             const parsed = parseBackupName(backup.file_name);
-            const haystack = `${backup.file_name} ${formatDate(parsed.timestamp)} ${formatDate(backup.last_mes)} ${backup.mes || ''}`.toLocaleLowerCase();
+            const haystack = `${backup.file_name} ${formatDate(parsed.timestamp)} ${formatDate(backup.last_mes)} ${backupLastMessage(backup)}`.toLocaleLowerCase();
             return haystack.includes(query);
         });
     };
@@ -2006,12 +2065,14 @@ function makeBackupsPanel(targetChat) {
             const date = document.createElement('strong');
             date.textContent = formatDate(parsed.timestamp);
             const meta = document.createElement('span');
-            meta.textContent = `${backup.file_size || '未知大小'} · ${backup.chat_items ?? '?'} 条消息`;
+            const count = backupMessageCount(backup);
+            meta.textContent = `${backup.file_size || '未知大小'} · ${count ?? '?'} 条消息`;
             headline.append(date, meta);
             const preview = document.createElement('span');
             preview.className = 'chm-backup-history-preview';
-            preview.textContent = chatPreview(backup.mes, 110) || '这个备份没有末条消息预览';
-            preview.title = String(backup.mes || '').replace(/\s+/g, ' ').trim();
+            const lastMessage = backupLastMessage(backup);
+            preview.textContent = chatPreview(lastMessage, 110) || '这个备份没有末条消息预览';
+            preview.title = String(lastMessage).replace(/\s+/g, ' ').trim();
             main.append(headline, preview);
             const actions = document.createElement('span');
             actions.className = 'chm-backup-history-actions';
@@ -2092,7 +2153,7 @@ function makeBackupsPanel(targetChat) {
             // XHR, not fetch: extensions patch window.fetch and answer this endpoint from their
             // own fast list, which drops the fields this page shows. SillyTavern-Mobile-Resize-Guard
             // intercepts every POST to it, so each row would read "没有末条消息预览".
-            const backupList = await postJsonRaw('/api/backups/chat/get', {}, CHAT_INDEX_REQUEST_TIMEOUT_MS);
+            const backupList = await postJson('/api/backups/chat/get', {}, CHAT_INDEX_REQUEST_TIMEOUT_MS);
             if (loadController.signal.aborted) return;
             if (!Array.isArray(backupList)) throw new Error('无法读取聊天备份列表');
             const source = String(targetChat.character?.avatar || '')
