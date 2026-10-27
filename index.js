@@ -1149,6 +1149,11 @@ async function copyChat(chat) {
             button.addEventListener('click', () => finish(value));
             actions.append(button);
         }
+        // The modal is attached to <body>, outside SillyTavern's drawer. Its global
+        // outside-click handler would otherwise collapse the character page on selection.
+        for (const type of ['mousedown', 'touchstart']) {
+            dialog.addEventListener(type, event => event.stopPropagation());
+        }
         dialog.addEventListener('cancel', event => {
             event.preventDefault();
             finish(null);
@@ -3446,6 +3451,11 @@ function attachNativeChatActions(wrapper, entry) {
         button.setAttribute('role', 'button');
         button.setAttribute('aria-label', title);
         button.tabIndex = 0;
+        // Native chat actions can live inside the character drawer; keep SillyTavern's
+        // global outside-click handler from closing that drawer before the click runs.
+        for (const type of ['mousedown', 'touchstart']) {
+            button.addEventListener(type, event => event.stopPropagation());
+        }
         button.addEventListener('click', event => {
             event.preventDefault();
             event.stopPropagation();
