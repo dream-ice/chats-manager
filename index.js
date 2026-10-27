@@ -12,7 +12,7 @@ import {
 import { extension_settings } from '../../../extensions.js';
 import { t } from '../../../i18n.js';
 import { Popup, POPUP_RESULT, POPUP_TYPE } from '../../../popup.js';
-import { download, getStringHash, humanFileSize, timestampToMoment } from '../../../utils.js';
+import { download, getStringHash, humanFileSize, timestampToMoment, uuidv4 } from '../../../utils.js';
 
 const MODULE_NAME = 'chatsManager';
 const ROOT_ID = 'chats-manager-root';
@@ -557,23 +557,62 @@ async function fetchChatIndex(character, id) {
     }
 }
 
+async function searchCharacterChats(entry, query) {
+    try {
+        const results = await postJson('/api/chats/search', {
+            query,
+            avatar_url: entry.character.avatar,
+            group_id: null,
+        }, CHAT_INDEX_REQUEST_TIMEOUT_MS);
+        if (!Array.isArray(results)) return null;
+        return new Set(results.filter(item => item?.file_name).map(item => chatName(item.file_name)));
+    } catch (error) {
+        console.warn('[Chats Manager] Full-text chat search failed for', getCharacterName(entry.character), error);
+        return null;
+    }
+}
+
+async function applyChatSearch(entries, query, generation) {
+    if (!query) {
+        for (const entry of entries) for (const chat of entry.chats) chat.searchMatch = false;
+        return;
+    }
+    const results = new Array(entries.length);
+    let nextIndex = 0;
+    const worker = async () => {
+        while (generation === loadGeneration && nextIndex < entries.length) {
+            const index = nextIndex++;
+            const entry = entries[index];
+            const characterMatches = getCharacterName(entry.character).toLocaleLowerCase().includes(query);
+            results[index] = characterMatches ? null : await searchCharacterChats(entry, query);
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(CHAT_LOAD_CONCURRENCY, entries.length) }, worker));
+    if (generation !== loadGeneration) return;
+    entries.forEach((entry, index) => {
+        const characterMatches = getCharacterName(entry.character).toLocaleLowerCase().includes(query);
+        const names = results[index];
+        for (const chat of entry.chats) {
+            const localMatch = `${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query);
+            chat.searchMatch = characterMatches || Boolean(names?.has(chat.fileName)) || localMatch;
+        }
+    });
+}
+
 // Reads one chat through /api/chats/export, which is a plain read: unlike /api/chats/get it
 // neither parses every line nor creates the character's chat directory when it is missing.
 // Only the first line is kept; the rest of the file is dropped immediately.
 // Returns null when the read was inconclusive, {} when the chat provably carries no metadata.
 async function harvestChatMeta(character, fileName) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), META_HARVEST_TIMEOUT_MS);
     try {
         const file = `${fileName}.jsonl`;
-        const response = await fetch('/api/chats/export', {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify({ is_group: false, avatar_url: character.avatar, file, exportfilename: file, format: 'jsonl' }),
-            signal: controller.signal,
-        });
-        if (!response.ok) return null;
-        const data = await response.json().catch(() => null);
+        const data = await postJson('/api/chats/export', {
+            is_group: false,
+            avatar_url: character.avatar,
+            file,
+            exportfilename: file,
+            format: 'jsonl',
+        }, META_HARVEST_TIMEOUT_MS);
         const raw = typeof data?.result === 'string' ? data.result : '';
         if (!raw) return null;
         const breakAt = raw.indexOf('\n');
@@ -591,12 +630,8 @@ async function harvestChatMeta(character, fileName) {
             ...(metadata.chat_id_hash ? { chat_id_hash: String(metadata.chat_id_hash) } : {}),
         };
     } catch (error) {
-        if (error?.name !== 'AbortError') {
-            console.warn('[Chats Manager] Could not read chat metadata for', fileName, error);
-        }
+        console.warn('[Chats Manager] Could not read chat metadata for', fileName, error);
         return null;
-    } finally {
-        clearTimeout(timeout);
     }
 }
 
@@ -951,7 +986,7 @@ async function validateBackToParentButton() {
 function treeMatches(node, query) {
     if (!query) return true;
     const haystack = `${getCharacterName(node.chat.character)} ${node.chat.fileName} ${node.chat.message}`.toLocaleLowerCase();
-    return haystack.includes(query) || node.children.some(child => treeMatches(child, query));
+    return node.chat.searchMatch || haystack.includes(query) || node.children.some(child => treeMatches(child, query));
 }
 
 function subtreeCount(node) {
@@ -1063,6 +1098,145 @@ async function renameChat(chat) {
     await refreshChats();
 }
 
+async function copyChat(chat) {
+    const context = SillyTavern.getContext();
+    const liveEntry = Object.entries(context.characters || []).find(([, character]) => characterKey(character) === chat.characterKey);
+    if (!liveEntry) {
+        toastr.error('找不到这个角色，无法复制聊天。');
+        return;
+    }
+    const [characterId, character] = liveEntry;
+    const names = await fetchChatNames(character, characterId);
+    if (!names) {
+        toastr.error('无法确认现有聊天列表，已取消复制以避免覆盖聊天。');
+        return;
+    }
+
+    const relationResult = await new Promise(resolve => {
+        const dialog = document.createElement('dialog');
+        dialog.className = 'chm-relation-dialog';
+        dialog.style.width = 'min(620px, calc(100vw - 32px))';
+        dialog.style.maxWidth = 'calc(100vw - 32px)';
+        const title = document.createElement('h3');
+        title.textContent = '选择副本的分支关系';
+        const note = document.createElement('p');
+        note.className = 'chm-popup-note';
+        note.textContent = '保留关系会让副本继续挂在原父聊天下；如果源聊天本身没有父聊天，副本会作为它的新分支。独立聊天不会出现在分支树中。';
+        const actions = document.createElement('div');
+        actions.className = 'chm-relation-dialog-actions';
+        let settled = false;
+        const finish = value => {
+            if (settled) return;
+            settled = true;
+            if (dialog.open) dialog.close();
+            dialog.remove();
+            resolve(value);
+        };
+        for (const [label, value] of [['保留分支关系', 'inherit'], ['复制为独立聊天', 'standalone'], ['取消', null]]) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'menu_button';
+            button.textContent = label;
+            Object.assign(button.style, {
+                width: 'auto',
+                minWidth: 'max-content',
+                flex: '0 0 auto',
+                whiteSpace: 'nowrap',
+                writingMode: 'horizontal-tb',
+                margin: '0',
+                padding: '8px 12px',
+            });
+            button.addEventListener('click', () => finish(value));
+            actions.append(button);
+        }
+        dialog.addEventListener('cancel', event => {
+            event.preventDefault();
+            finish(null);
+        });
+        dialog.addEventListener('close', () => finish(null));
+        dialog.append(title, note, actions);
+        document.body.append(dialog);
+        dialog.showModal();
+    });
+    if (relationResult === null) return;
+    const inheritBranch = relationResult === 'inherit';
+
+    const suggestedName = `${chat.fileName} - 副本`;
+    const value = await Popup.show.input('复制聊天记录', '输入新聊天的名称', suggestedName);
+    const nextName = chatName(String(value ?? '').trim());
+    if (!nextName) return;
+    if (names.some(item => item.fileName === nextName)) {
+        toastr.warning(`聊天“${nextName}”已经存在，请换一个名称。`);
+        return;
+    }
+
+    const sourceIsCurrent = characterKey(context.characters?.[context.characterId]) === chat.characterKey
+        && currentChatName() === chat.fileName;
+    try {
+        if (sourceIsCurrent) await context.saveChat?.();
+
+        const source = await postJson('/api/chats/export', {
+            is_group: false,
+            avatar_url: character.avatar,
+            file: `${chat.fileName}.jsonl`,
+            exportfilename: `${chat.fileName}.jsonl`,
+            format: 'jsonl',
+        }, CHAT_DETAIL_TIMEOUT_MS);
+        if (typeof source?.result !== 'string' || !source.result.trim()) {
+            throw new Error('源聊天没有返回有效内容。');
+        }
+
+        const messages = source.result.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+        const header = messages[0];
+        if (!header || typeof header !== 'object' || Array.isArray(header)
+            || !(header.name || header.character_name || header.chat_metadata)) {
+            throw new Error('源聊天格式无效，未创建副本。');
+        }
+
+        // By default, copies are independent. The user may keep the source branch relationship.
+        if (!header.chat_metadata || typeof header.chat_metadata !== 'object' || Array.isArray(header.chat_metadata)) {
+            header.chat_metadata = {};
+        }
+        const metadata = header.chat_metadata;
+        if (inheritBranch) {
+            metadata.main_chat ||= chat.fileName;
+            metadata.integrity ||= uuidv4();
+            metadata.chat_id_hash ||= getStringHash(metadata.main_chat);
+        } else {
+            delete metadata.main_chat;
+            metadata.integrity = uuidv4();
+            metadata.chat_id_hash = getStringHash(nextName);
+        }
+
+        const destinationExists = await chatFileExists(character, nextName);
+        if (destinationExists !== false) {
+            throw new Error(destinationExists === true
+                ? `聊天“${nextName}”已经存在，请换一个名称。`
+                : '无法确认目标名称是否可用，已取消复制以避免覆盖聊天。');
+        }
+
+        await postJson('/api/chats/save', {
+            avatar_url: character.avatar,
+            file_name: nextName,
+            chat: messages,
+        }, CHAT_DETAIL_TIMEOUT_MS);
+
+        const library = getLibrary(chat.characterKey);
+        const sourceRootName = getRootChatName(chat);
+        if (library.chatFolders[sourceRootName]) library.chatFolders[nextName] = library.chatFolders[sourceRootName];
+        storeChatMeta(chat.characterKey, nextName, metadata || {});
+        rememberChatSize(character.avatar, nextName, Math.max(0, messages.length - 1), { allowShrink: true });
+        saveSettings();
+        invalidateCharacterCache(chat.characterKey);
+        await refreshChats();
+        scheduleNativeChatGrouping();
+        toastr.success(`已复制为“${nextName}”`);
+    } catch (error) {
+        console.error('[Chats Manager] Copy chat failed', error);
+        toastr.error(`复制聊天失败：${error.message}`);
+    }
+}
+
 async function createFolder(characterKeyValue) {
     const name = String(await Popup.show.input('新建分组', '给这个分组起一个简短的名字', '') ?? '').trim();
     if (!name) return null;
@@ -1079,6 +1253,7 @@ async function renameFolder(characterKeyValue, folder) {
     folder.name = name;
     saveSettings();
     await refreshChats();
+    scheduleNativeChatGrouping();
 }
 
 async function deleteFolder(characterKeyValue, folder) {
@@ -1100,58 +1275,59 @@ async function deleteFolder(characterKeyValue, folder) {
     }
     saveSettings();
     await refreshChats();
+    scheduleNativeChatGrouping();
+}
+
+function createFolderPicker(characterKeyValue, selectedFolderId = '', unfiledLabel = '未分组') {
+    const library = getLibrary(characterKeyValue);
+    const content = document.createElement('div');
+    content.className = 'chm-folder-picker';
+    const select = document.createElement('select');
+    select.className = 'text_pole wide100p';
+    const unfiled = document.createElement('option');
+    unfiled.value = '';
+    unfiled.textContent = unfiledLabel;
+    select.append(unfiled);
+    for (const folder of library.folders) {
+        const option = document.createElement('option');
+        option.value = folder.id;
+        option.textContent = folder.name;
+        select.append(option);
+    }
+    select.value = selectedFolderId;
+
+    const addFolder = document.createElement('button');
+    addFolder.type = 'button';
+    addFolder.className = 'menu_button chm-picker-add';
+    addFolder.innerHTML = '<i class="fa-solid fa-plus"></i> 新建分组';
+    addFolder.addEventListener('click', async () => {
+        const folder = await createFolder(characterKeyValue);
+        if (!folder) return;
+        const option = document.createElement('option');
+        option.value = folder.id;
+        option.textContent = folder.name;
+        select.append(option);
+        select.value = folder.id;
+    });
+    content.append(select, addFolder);
+    return { content, select };
 }
 
 async function chooseFolder(chat) {
     const library = getLibrary(chat.characterKey);
     const rootName = getRootChatName(chat);
-    const content = document.createElement('div');
-    content.className = 'chm-folder-picker';
+    const { content, select } = createFolderPicker(chat.characterKey, library.chatFolders[rootName] || '');
     const title = document.createElement('h3');
     title.textContent = '移动到分组';
-    content.append(title);
-    const options = document.createElement('div');
-    options.className = 'chm-folder-options';
-    const current = library.chatFolders[rootName] || '';
-    const choices = [{ id: '', name: '未分组', icon: 'fa-inbox' }, ...library.folders.map(folder => ({ ...folder, icon: 'fa-folder' }))];
-    for (const choice of choices) {
-        const label = document.createElement('label');
-        label.className = 'chm-folder-option';
-        const radio = document.createElement('input');
-        radio.type = 'radio';
-        radio.name = 'chm-folder';
-        radio.value = choice.id;
-        radio.checked = current === choice.id;
-        const icon = document.createElement('i');
-        icon.className = `fa-regular ${choice.icon}`;
-        const text = document.createElement('span');
-        text.textContent = choice.name;
-        label.append(radio, icon, text);
-        options.append(label);
-    }
-    content.append(options);
-    const add = document.createElement('button');
-    add.type = 'button';
-    add.className = 'menu_button chm-picker-add';
-    add.innerHTML = '<i class="fa-solid fa-plus"></i> 新建分组';
-    add.addEventListener('click', async () => {
-        const folder = await createFolder(chat.characterKey);
-        if (!folder) return;
-        const label = document.createElement('label');
-        label.className = 'chm-folder-option';
-        label.innerHTML = `<input type="radio" name="chm-folder" value="${folder.id}"><i class="fa-regular fa-folder"></i><span></span>`;
-        label.querySelector('span').textContent = folder.name;
-        options.append(label);
-        label.querySelector('input').checked = true;
-    });
-    content.append(add);
+    content.prepend(title);
     const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '移动', cancelButton: t`Cancel` });
     if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
-    const selected = content.querySelector('input[name="chm-folder"]:checked')?.value || '';
+    const selected = select.value;
     if (selected) library.chatFolders[rootName] = selected;
     else delete library.chatFolders[rootName];
     saveSettings();
     await refreshChats();
+    scheduleNativeChatGrouping();
 }
 
 async function exportChats(chats, format) {
@@ -1341,11 +1517,18 @@ function parseBackupName(name) {
     return { source, timestamp };
 }
 
+function backupSourceKey(avatar) {
+    // Match src/endpoints/chats.js: backupChat removes `.png` before sanitizing the name.
+    return String(avatar || '')
+        .replace('.png', '')
+        .replace(/[^a-z0-9]/gi, '_')
+        .toLowerCase();
+}
+
 function backupSourceLabel(source) {
     const normalized = String(source).toLowerCase();
     const descriptor = getCharacterDescriptors().find(item => {
-        const avatar = String(item.character.avatar || '').replace(/\.[^.]+$/i, '').replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        return avatar === normalized;
+        return backupSourceKey(item.character.avatar) === normalized;
     });
     return descriptor ? getCharacterName(descriptor.character) : source;
 }
@@ -2000,6 +2183,7 @@ function makeBackupsPanel(targetChat) {
     let pageSize = BACKUP_HISTORY_DEFAULT_PAGE_SIZE;
     let batchMode = false;
     let ambiguousSiblings = 0;
+    let unidentifiedBackups = false;
     let loaded = false;
     let loading = false;
     let loadController = null;
@@ -2104,11 +2288,15 @@ function makeBackupsPanel(targetChat) {
         count.textContent = loading
             ? '正在识别聊天备份…'
             : search.value.trim() ? `${filtered.length} / ${allBackups().length} 份备份` : `${filtered.length} 份备份`;
-        const showNote = !loading && loaded && ambiguousSiblings > 1 && allBackups().length > 0;
+        const showNote = !loading && loaded && (ambiguousSiblings > 1 || unidentifiedBackups) && allBackups().length > 0;
         note.hidden = !showNote;
         if (showNote) {
-            note.textContent = `与 ${ambiguousSiblings - 1} 个分支共用备份，酒馆未记录每份属于哪一个`;
-            note.title = '酒馆的备份文件按角色命名，而分支会继承父聊天的标识，所以一个分支家族共用同一批备份。请用下面的时间、楼层数和末条预览来判断要恢复哪一份。恢复始终导入为新聊天，不会覆盖现有聊天。';
+            note.textContent = unidentifiedBackups
+                ? '这些旧备份没有聊天标识，无法确认具体归属'
+                : `与 ${ambiguousSiblings - 1} 个分支共用备份，酒馆未记录每份属于哪一个`;
+            note.title = unidentifiedBackups
+                ? '酒馆原生备份列表也会显示这些文件，但旧备份没有聊天标识。这里把它们列出方便查看和恢复，请先根据时间、楼层数和末条预览确认内容。恢复始终导入为新聊天，不会覆盖现有聊天。'
+                : '酒馆的备份文件按角色命名，而分支会继承父聊天的标识，所以一个分支家族共用同一批备份。请用下面的时间、楼层数和末条预览来判断要恢复哪一份。恢复始终导入为新聊天，不会覆盖现有聊天。';
         }
         pagination.replaceChildren();
         const status = document.createElement('span');
@@ -2156,14 +2344,20 @@ function makeBackupsPanel(targetChat) {
             const backupList = await postJson('/api/backups/chat/get', {}, CHAT_INDEX_REQUEST_TIMEOUT_MS);
             if (loadController.signal.aborted) return;
             if (!Array.isArray(backupList)) throw new Error('无法读取聊天备份列表');
-            const source = String(targetChat.character?.avatar || '')
-                .replace(/\.[^.]+$/i, '')
-                .replace(/[^a-z0-9]/gi, '_')
-                .toLowerCase();
+            const source = backupSourceKey(targetChat.character?.avatar);
             const backups = backupList.filter(backup => parseBackupName(backup.file_name).source.toLowerCase() === source);
             await identifyBackups(backups, loadController.signal, (done, total) => {
                 count.textContent = `正在识别聊天… ${done}/${total}`;
             });
+            if (!hasStoredChatMeta(targetChat.characterKey, targetChat.fileName)) {
+                const metadata = await harvestChatMeta(targetChat.character, targetChat.fileName);
+                if (loadController.signal.aborted) return;
+                if (metadata !== null) {
+                    targetChat.metadata = metadata;
+                    storeChatMeta(targetChat.characterKey, targetChat.fileName, metadata);
+                    saveSettings();
+                }
+            }
             const integrity = targetChat.metadata?.integrity || '';
             const candidateHashes = new Set([
                 targetChat.metadata?.chat_id_hash,
@@ -2173,9 +2367,14 @@ function makeBackupsPanel(targetChat) {
                     .filter(([, currentName]) => currentName === targetChat.fileName)
                     .map(([oldName]) => getStringHash(oldName)),
             ].filter(Boolean).map(String));
-            groups = groupBackupsByChat(backups).filter(group => (
+            const backupGroups = groupBackupsByChat(backups);
+            groups = backupGroups.filter(group => (
                 integrity ? group.identity === integrity : candidateHashes.has(String(group.chatHash))
             ));
+            if (!groups.length) {
+                groups = backupGroups.filter(group => !group.chatHash && group.identity === group.latest.file_name);
+                unidentifiedBackups = groups.length > 0;
+            }
             // SillyTavern names backups after the character, not the chat, and a branch family
             // shares both the integrity slug and main_chat. Siblings therefore cannot be told
             // apart from the backup alone; say so instead of implying a precise match.
@@ -2385,6 +2584,7 @@ function createChatActionsMenu(chat, { depth = 0, descendants = 0 } = {}) {
             await refreshChats();
         }),
         menuAction('fa-regular fa-folder-open', depth || descendants ? '移动聊天树' : '移动到分组', () => chooseFolder(chat)),
+        menuAction('fa-regular fa-copy', '复制聊天记录', () => copyChat(chat)),
         menuAction('fa-solid fa-file-export', '导出 JSONL', () => exportChats([chat], 'jsonl')),
         menuAction('fa-regular fa-file-lines', '导出 TXT', () => exportChats([chat], 'txt')),
         menuAction('fa-regular fa-trash-can', '删除聊天', () => deleteChats([chat]), 'chm-menu-danger'),
@@ -2679,7 +2879,7 @@ function renderFocusedCharacter(entry, query, container) {
 
 function chatMatchesQuery(chat, query) {
     if (!query) return true;
-    return `${getCharacterName(chat.character)} ${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query);
+    return chat.searchMatch || `${getCharacterName(chat.character)} ${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query);
 }
 
 function renderPinnedSection(entries, query, container) {
@@ -2778,7 +2978,11 @@ async function refreshChats(force = false, { background = false } = {}) {
     const activeDescriptor = activeKey ? descriptors.find(entry => entry.key === activeKey) : null;
     const focused = Boolean(activeDescriptor && !browseAllCharacters);
     let activeEntry = null;
-    if (focused) activeEntry = await loadCharacterEntry(activeDescriptor, force);
+    if (focused) {
+        activeEntry = await loadCharacterEntry(activeDescriptor, force);
+        if (generation !== loadGeneration) return;
+        await applyChatSearch([activeEntry], query, generation);
+    }
     if (generation !== loadGeneration) return;
     list.replaceChildren();
     renderedChats.clear();
@@ -2786,7 +2990,7 @@ async function refreshChats(force = false, { background = false } = {}) {
     if (focused) {
         const matches = !query
             || getCharacterName(activeEntry.character).toLocaleLowerCase().includes(query)
-            || activeEntry.chats.some(chat => `${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query));
+            || activeEntry.chats.some(chat => chat.searchMatch);
         updatePagination(matches ? 1 : 0, 0, matches ? 1 : 0, 1);
         if (matches) {
             renderPinnedSection([activeEntry], query, list);
@@ -2811,9 +3015,11 @@ async function refreshChats(force = false, { background = false } = {}) {
     if (needsFullIndex) {
         const characters = (await loadCharacterEntries(candidates, force)).filter(entry => entry.chats.length > 0);
         if (generation !== loadGeneration) return;
+        await applyChatSearch(characters, query, generation);
+        if (generation !== loadGeneration) return;
         visible = characters.filter(entry => !query
             || getCharacterName(entry.character).toLocaleLowerCase().includes(query)
-            || entry.chats.some(chat => `${chat.fileName} ${chat.message}`.toLocaleLowerCase().includes(query)));
+            || entry.chats.some(chat => chat.searchMatch));
         const sorters = {
             recent: (a, b) => entryTimestamp(b) - entryTimestamp(a) || getCharacterName(a.character).localeCompare(getCharacterName(b.character)),
             name: (a, b) => getCharacterName(a.character).localeCompare(getCharacterName(b.character)),
@@ -3226,6 +3432,42 @@ function attachNativeBatchCheckbox(wrapper) {
     wrapper.classList.toggle('chm-native-selected', checkbox.checked);
 }
 
+function attachNativeChatActions(wrapper, entry) {
+    const actions = wrapper.querySelector('.select_chat_actions');
+    const fileName = nativeChatFileName(wrapper);
+    if (!actions || !fileName || actions.querySelector('.chm-native-row-action')) return;
+    const chat = entry.chats.find(item => item.fileName === fileName)
+        || makeChatEntry(entry.character, entry.id, { fileName });
+
+    const makeAction = (icon, title, handler) => {
+        const button = document.createElement('div');
+        button.className = `chm-native-row-action opacity50p hoverglow ${icon}`;
+        button.title = title;
+        button.setAttribute('role', 'button');
+        button.setAttribute('aria-label', title);
+        button.tabIndex = 0;
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            void handler();
+        });
+        button.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            event.stopPropagation();
+            void handler();
+        });
+        return button;
+    };
+    const move = makeAction('fa-solid fa-folder-open', '移动到分组', async () => {
+        await chooseFolder(chat);
+        scheduleNativeChatGrouping();
+    });
+    const copy = makeAction('fa-solid fa-copy', '复制聊天记录', () => copyChat(chat));
+    actions.prepend(copy);
+    actions.prepend(move);
+}
+
 async function batchExportNativeChats(format) {
     const names = selectedNativeChatNames();
     if (!names.length) return;
@@ -3278,23 +3520,10 @@ async function batchMoveNativeChats() {
         });
     }
     const library = getLibrary(entry.key);
-    if (!library.folders.length) return toastr.info('请先在 Chats 页面创建一个聊天分组。');
-    const content = document.createElement('div');
     const title = document.createElement('h3');
     title.textContent = `移动 ${names.length} 个聊天到分组`;
-    const select = document.createElement('select');
-    select.className = 'text_pole wide100p';
-    const unfiled = document.createElement('option');
-    unfiled.value = '';
-    unfiled.textContent = '移出分组';
-    select.append(unfiled);
-    for (const folder of library.folders) {
-        const option = document.createElement('option');
-        option.value = folder.id;
-        option.textContent = folder.name;
-        select.append(option);
-    }
-    content.append(title, select);
+    const { content, select } = createFolderPicker(entry.key, '', '移出分组');
+    content.prepend(title);
     const popup = new Popup(content, POPUP_TYPE.CONFIRM, '', { okButton: '移动', cancelButton: t`Cancel` });
     if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
     const chatsByName = new Map(entry.chats.map(chat => [chat.fileName, chat]));
@@ -3540,6 +3769,7 @@ async function applyNativeChatGrouping(generation = nativeGroupingGeneration) {
         }
         wrappers.forEach(attachNativeBatchCheckbox);
         wrappers.forEach(resetNativeChatTree);
+        if (entry && !context.groupId) wrappers.forEach(wrapper => attachNativeChatActions(wrapper, entry));
         updateNativeBatchToolbar();
         if (!entry || context.groupId || !wrappers.length) return;
         const library = getLibrary(entry.key);

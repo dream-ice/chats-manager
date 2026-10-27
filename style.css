@@ -877,6 +877,37 @@ details:not([open]) > .chm-row-menu-popover { display: none; }
 .chm-picker-add { width: 100%; margin-top: 10px; }
 .chm-popup-note { opacity: .65; font-size: .9em; }
 
+.chm-relation-dialog {
+    width: min(620px, calc(100vw - 32px));
+    max-width: calc(100vw - 32px);
+    box-sizing: border-box;
+    padding: 20px;
+    color: var(--SmartThemeBodyColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+    background: var(--SmartThemeBlurTintColor);
+    box-shadow: 0 12px 40px #0008;
+}
+.chm-relation-dialog::backdrop { background: #0009; }
+.chm-relation-dialog h3 { margin: 0 0 10px; text-align: center; }
+.chm-relation-dialog p { margin: 0; text-align: center; }
+.chm-relation-dialog-actions {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 20px;
+}
+.chm-relation-dialog-actions > .menu_button {
+    width: auto;
+    min-width: max-content;
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 8px 12px;
+    white-space: nowrap;
+    writing-mode: horizontal-tb;
+}
+
 #option_back_to_main.chm-invalid-parent-chat { display: none !important; }
 
 /* Folder projection inside SillyTavern's native Chat History manager. */
@@ -921,6 +952,8 @@ details:not([open]) > .chm-row-menu-popover { display: none; }
 .chm-native-batch-delete:not(:disabled):hover { color: var(--SmartThemeDangerColor, #d36a6a); }
 .chm-native-selected-count { margin: 0 auto 0 2px; font-size: .76em; white-space: nowrap; opacity: .62; }
 .chm-native-batch-toolbar.is-busy { pointer-events: none; opacity: .55; }
+
+.select_chat_actions .chm-native-row-action { cursor: pointer; }
 
 /* Keep the injected checkbox beside the native card even when themes alter
    SillyTavern's wrapping flex utilities or popup alignment. */
