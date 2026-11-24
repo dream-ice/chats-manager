@@ -67,6 +67,7 @@ let nativeGroupingGeneration = 0;
 let nativeBatchMode = false;
 let nativeBatchCharacterKey = '';
 let parentButtonValidationGeneration = 0;
+let characterListScrollTop = null;
 const nativeSelectedChats = new Set();
 let chatsBatchMode = false;
 let chatsBatchBusy = false;
@@ -3347,6 +3348,13 @@ function installTabs() {
     const characterPanel = document.createElement('div');
     characterPanel.id = 'chats-manager-characters';
     characterPanel.className = 'chm-tab-panel';
+    // Capture before SillyTavern's character click handler switches the active card/chat.
+    // That handler can reset the list scroll; restore this position when the list is shown again.
+    characterPanel.addEventListener('click', event => {
+        if (!event.target.closest('.character_select, .group_select')) return;
+        const list = document.getElementById('rm_print_characters_block');
+        if (list) characterListScrollTop = list.scrollTop;
+    }, true);
     chatsPanel = makeChatsPanel();
     adoptCharacterContent(menu, characterPanel);
     content.append(characterPanel, chatsPanel);
@@ -3361,6 +3369,12 @@ function installTabs() {
         chatsPanel.hidden = !chatsActive;
         settings().defaultTab = chatsActive ? 'chats' : 'characters';
         saveSettings();
+        if (!chatsActive && characterListScrollTop !== null) {
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                const list = document.getElementById('rm_print_characters_block');
+                if (list) list.scrollTop = characterListScrollTop;
+            }));
+        }
         if (chatsActive) void refreshChats();
     };
     characterButton.addEventListener('click', () => {
